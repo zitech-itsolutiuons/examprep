@@ -58,7 +58,9 @@
       "Bash(python -m json.tool)",
       "Bash(curl -s -b gj.txt http://localhost:3000/api/auth/session)",
       "Bash(curl -s -o /dev/null -b gj.txt http://localhost:3000/dashboard)",
-      "Bash(curl -s -o /dev/null -b gj.txt http://localhost:3000/profile)"
+      "Bash(curl -s -o /dev/null -b gj.txt http://localhost:3000/profile)",
+      "Bash(rm -f next.config.js.utf16.bak vercel.json.utf16.bak)",
+      "Bash(curl -s -o /dev/null http://localhost:3000/dashboard)"
     ]
   }
 }
