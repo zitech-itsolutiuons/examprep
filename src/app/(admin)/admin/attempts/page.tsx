@@ -1,8 +1,9 @@
 import Link from "next/link";
-import type { Prisma } from "@prisma/client";
 import { ClipboardList } from "lucide-react";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import { normalizeIds } from "@/lib/serialize";
+import { ExamAttemptModel, SubjectModel, UserModel } from "@/models";
 import { requireAdmin } from "@/lib/rbac";
 import { PageHeader } from "@/components/layout/page-header";
 import { Badge } from "@/components/ui/badge";
@@ -76,33 +77,67 @@ export default async function AdminAttemptsPage({ searchParams }: SearchParams) 
   const who = searchParams.who === "guests" || searchParams.who === "accounts" ? searchParams.who : "";
   const page = Math.max(1, Number(searchParams.page ?? 1) || 1);
 
-  const where: Prisma.ExamAttemptWhereInput = {
+  await connectToDatabase();
+
+  /**
+   * The `who` filter was a join (`user: { role: "GUEST" }`). Without one, the guest ids are
+   * resolved first and matched with `$in` / `$nin` — the same approach the analytics and
+   * home services take, and bounded for the same reason: guests are capped per code and
+   * swept after 30 days.
+   */
+  const guestIds =
+    who === "guests" || who === "accounts"
+      ? (await UserModel.distinct("_id", { role: "GUEST" })).map(String)
+      : [];
+
+  const filter: Record<string, unknown> = {
     ...(status ? { status } : {}),
     ...(subjectId ? { subjectId } : {}),
     ...(userId ? { userId } : {}),
     // Guest attempts are listed here by default — this is the one screen where they belong,
     // since it is a record of what happened rather than a performance statistic.
-    ...(who === "guests" ? { user: { role: "GUEST" } } : {}),
-    ...(who === "accounts" ? { user: { role: { not: "GUEST" } } } : {}),
+    ...(who === "guests" ? { userId: { $in: guestIds } } : {}),
+    ...(who === "accounts" && guestIds.length > 0 ? { userId: { $nin: guestIds } } : {}),
   };
 
-  const [attempts, total, subjects, scopedUser] = await Promise.all([
-    prisma.examAttempt.findMany({
-      where,
-      orderBy: { startedAt: "desc" },
-      skip: (page - 1) * PAGE_SIZE,
-      take: PAGE_SIZE,
-      include: {
-        user: { select: { id: true, name: true, email: true, role: true } },
-        subject: { select: { id: true, title: true, passMark: true } },
-      },
-    }),
-    prisma.examAttempt.count({ where }),
-    prisma.subject.findMany({ orderBy: { title: "asc" }, select: { id: true, title: true } }),
+  const [attemptsRaw, total, subjectsRaw, scopedUserRaw] = await Promise.all([
+    ExamAttemptModel.find(filter)
+      .sort({ startedAt: -1 })
+      .skip((page - 1) * PAGE_SIZE)
+      .limit(PAGE_SIZE)
+      .populate({ path: "user", select: "name email role" })
+      .populate({ path: "subject", select: "title passMark" })
+      .lean(),
+    ExamAttemptModel.countDocuments(filter),
+    SubjectModel.find().sort({ title: 1 }).select("title").lean(),
     userId
-      ? prisma.user.findUnique({ where: { id: userId }, select: { name: true, email: true } })
+      ? UserModel.findOne({ _id: userId }).select("name email").lean()
       : Promise.resolve(null),
   ]);
+
+  // A `userId` filter and a `who` filter can contradict each other (one student who is not a
+  // guest, filtered to guests only); the query above resolves that by intersecting, so this
+  // list is simply empty in that case rather than misreporting.
+  const attempts = normalizeIds(attemptsRaw) as unknown as Array<{
+    id: string;
+    status: keyof typeof STATUS_LABEL;
+    attemptNumber: number;
+    score: number | null;
+    totalPoints: number | null;
+    percentage: number | null;
+    timeSpentSec: number | null;
+    startedAt: Date;
+    user: { id: string; name: string; email: string; role: string } | null;
+    subject: { id: string; title: string; passMark: number } | null;
+  }>;
+
+  const subjects = (
+    normalizeIds(subjectsRaw) as unknown as Array<{ id: string; title: string }>
+  ).map((subject) => ({ id: subject.id, title: subject.title }));
+
+  const scopedUser = scopedUserRaw
+    ? (normalizeIds(scopedUserRaw) as unknown as { name: string; email: string })
+    : null;
 
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
@@ -163,37 +198,55 @@ export default async function AdminAttemptsPage({ searchParams }: SearchParams) 
                 </TableHeader>
                 <TableBody>
                   {attempts.map((attempt) => {
+                    // Both relations are populated virtuals, so a deleted user or subject
+                    // leaves them null where SQL's foreign key made that impossible. The
+                    // row still renders — this is an audit list, and hiding the attempt
+                    // would misreport the totals shown below.
+                    const { user, subject } = attempt;
                     const passed =
                       attempt.percentage !== null &&
-                      attempt.percentage >= attempt.subject.passMark;
+                      subject !== null &&
+                      attempt.percentage >= subject.passMark;
 
                     return (
                       <TableRow key={attempt.id}>
                         <TableCell>
                           <div className="flex items-center gap-2">
-                            <Link
-                              href={`/admin/attempts?userId=${attempt.user.id}`}
-                              className="text-sm font-medium hover:text-primary hover:underline"
-                            >
-                              {attempt.user.name ?? attempt.user.email}
-                            </Link>
-                            {attempt.user.role === "GUEST" && (
-                              <Badge variant="secondary">Guest</Badge>
+                            {user ? (
+                              <Link
+                                href={`/admin/attempts?userId=${user.id}`}
+                                className="text-sm font-medium hover:text-primary hover:underline"
+                              >
+                                {user.name ?? user.email}
+                              </Link>
+                            ) : (
+                              <span className="text-sm font-medium text-muted-foreground">
+                                Deleted user
+                              </span>
                             )}
+                            {user?.role === "GUEST" && <Badge variant="secondary">Guest</Badge>}
                           </div>
                           {/* A guest's address is synthetic, so showing it would be noise. */}
                           <p className="truncate text-xs text-muted-foreground">
-                            {attempt.user.role === "GUEST" ? "Access code session" : attempt.user.email}
+                            {user === null
+                              ? "—"
+                              : user.role === "GUEST"
+                                ? "Access code session"
+                                : user.email}
                           </p>
                         </TableCell>
 
                         <TableCell>
-                          <Link
-                            href={`/admin/subjects/${attempt.subject.id}`}
-                            className="text-sm hover:text-primary hover:underline"
-                          >
-                            {attempt.subject.title}
-                          </Link>
+                          {subject ? (
+                            <Link
+                              href={`/admin/subjects/${subject.id}`}
+                              className="text-sm hover:text-primary hover:underline"
+                            >
+                              {subject.title}
+                            </Link>
+                          ) : (
+                            <span className="text-sm text-muted-foreground">Deleted subject</span>
+                          )}
                         </TableCell>
 
                         <TableCell className="text-right tabular-nums text-muted-foreground">

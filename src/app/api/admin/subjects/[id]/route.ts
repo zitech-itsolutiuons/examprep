@@ -1,10 +1,14 @@
 import { NextResponse } from "next/server";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import { normalizeIds } from "@/lib/serialize";
 import { requireApiAdmin } from "@/lib/rbac";
 import { badRequest, conflict, notFound, readJson, validationError } from "@/lib/api";
+import { ExamAttemptModel, QuestionModel, SubjectModel } from "@/models";
 import { subjectUpdateSchema } from "@/server/validators/subject";
 import { activeQuestionCount } from "@/server/services/subjects";
+import { attachCount, attachCounts, countByParent } from "@/server/services/counts";
+import { deleteSubjects } from "@/server/services/cascade";
 import { writeAudit } from "@/server/services/audit";
 
 type Params = { params: { id: string } };
@@ -13,15 +17,35 @@ export async function GET(_req: Request, { params }: Params) {
   const auth = await requireApiAdmin();
   if (auth.error) return auth.error;
 
-  const subject = await prisma.subject.findUnique({
-    where: { id: params.id },
-    include: {
-      topics: { orderBy: { name: "asc" }, include: { _count: { select: { questions: true } } } },
-      _count: { select: { questions: true, attempts: true } },
-    },
-  });
+  await connectToDatabase();
 
-  if (!subject) return notFound("Subject");
+  const raw = await SubjectModel.findOne({ _id: params.id })
+    .populate({ path: "topics", options: { sort: { name: 1 } } })
+    .lean();
+
+  if (!raw) return notFound("Subject");
+
+  const row = normalizeIds(raw) as unknown as Record<string, unknown> & {
+    id: string;
+    topics: Array<Record<string, unknown> & { id: string }>;
+  };
+
+  const [questions, attempts, topicQuestions] = await Promise.all([
+    countByParent(QuestionModel, "subjectId", [row.id]),
+    countByParent(ExamAttemptModel, "subjectId", [row.id]),
+    // Per-topic question totals — was the nested `_count` inside `topics`.
+    countByParent(
+      QuestionModel,
+      "topicId",
+      (row.topics ?? []).map((topic) => topic.id)
+    ),
+  ]);
+
+  const subject = {
+    ...attachCount(row, { questions, attempts }),
+    topics: attachCounts(row.topics ?? [], { questions: topicQuestions }),
+  };
+
   return NextResponse.json({ subject });
 }
 
@@ -32,7 +56,9 @@ export async function PATCH(req: Request, { params }: Params) {
   const parsed = subjectUpdateSchema.safeParse(await readJson(req));
   if (!parsed.success) return validationError(parsed.error);
 
-  const existing = await prisma.subject.findUnique({ where: { id: params.id } });
+  await connectToDatabase();
+
+  const existing = await SubjectModel.findOne({ _id: params.id }).select("isPublished").lean();
   if (!existing) return notFound("Subject");
 
   const { title, description, imageUrl, durationMin, passMark, isPublished, isActive } =
@@ -46,19 +72,26 @@ export async function PATCH(req: Request, { params }: Params) {
     }
   }
 
-  const subject = await prisma.subject.update({
-    where: { id: params.id },
-    data: {
-      // The slug stays fixed after creation so existing student links keep resolving.
-      ...(title !== undefined ? { title } : {}),
-      ...(description !== undefined ? { description: description || null } : {}),
-      ...(imageUrl !== undefined ? { imageUrl: imageUrl || null } : {}),
-      ...(durationMin !== undefined ? { durationMin } : {}),
-      ...(passMark !== undefined ? { passMark } : {}),
-      ...(isPublished !== undefined ? { isPublished } : {}),
-      ...(isActive !== undefined ? { isActive } : {}),
+  const updated = await SubjectModel.findOneAndUpdate(
+    { _id: params.id },
+    {
+      $set: {
+        // The slug stays fixed after creation so existing student links keep resolving.
+        ...(title !== undefined ? { title } : {}),
+        ...(description !== undefined ? { description: description || null } : {}),
+        ...(imageUrl !== undefined ? { imageUrl: imageUrl || null } : {}),
+        ...(durationMin !== undefined ? { durationMin } : {}),
+        ...(passMark !== undefined ? { passMark } : {}),
+        ...(isPublished !== undefined ? { isPublished } : {}),
+        ...(isActive !== undefined ? { isActive } : {}),
+      },
     },
-  });
+    { new: true }
+  ).lean();
+
+  if (!updated) return notFound("Subject");
+
+  const subject = normalizeIds(updated) as unknown as { id: string };
 
   await writeAudit({
     userId: auth.user.id,
@@ -75,20 +108,23 @@ export async function DELETE(_req: Request, { params }: Params) {
   const auth = await requireApiAdmin();
   if (auth.error) return auth.error;
 
-  const subject = await prisma.subject.findUnique({
-    where: { id: params.id },
-    select: { id: true, title: true, _count: { select: { attempts: true } } },
-  });
+  await connectToDatabase();
+
+  const subject = await SubjectModel.findOne({ _id: params.id }).select("title").lean();
   if (!subject) return notFound("Subject");
 
+  const attemptCount = await ExamAttemptModel.countDocuments({ subjectId: params.id });
+
   // Attempts are permanent student records — deactivate instead of destroying history.
-  if (subject._count.attempts > 0) {
+  if (attemptCount > 0) {
     return conflict(
-      `This subject has ${subject._count.attempts} recorded attempt(s). Deactivate it instead of deleting, so student results are preserved.`
+      `This subject has ${attemptCount} recorded attempt(s). Deactivate it instead of deleting, so student results are preserved.`
     );
   }
 
-  await prisma.subject.delete({ where: { id: params.id } });
+  // Topics and questions (with their options) have no database-level cascade behind them
+  // any more, so the delete goes through the explicit one.
+  await deleteSubjects([params.id]);
 
   await writeAudit({
     userId: auth.user.id,

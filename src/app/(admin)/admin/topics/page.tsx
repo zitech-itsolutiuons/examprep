@@ -1,7 +1,9 @@
 import Link from "next/link";
 import { Tags } from "lucide-react";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import { normalizeIds } from "@/lib/serialize";
+import { QuestionModel, SubjectModel } from "@/models";
 import { requireAdmin } from "@/lib/rbac";
 import { PageHeader } from "@/components/layout/page-header";
 import { Badge } from "@/components/ui/badge";
@@ -9,21 +11,35 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { EmptyState } from "@/components/ui/empty-state";
 import { Button } from "@/components/ui/button";
 import { TopicManager, type TopicRow } from "@/components/admin/topic-manager";
+import { countByParent } from "@/server/services/counts";
 
 export const metadata = { title: "Topics" };
 
 export default async function AdminTopicsPage() {
   await requireAdmin();
 
-  const subjects = await prisma.subject.findMany({
-    orderBy: { title: "asc" },
-    include: {
-      topics: {
-        orderBy: { name: "asc" },
-        include: { _count: { select: { questions: true } } },
-      },
-    },
-  });
+  await connectToDatabase();
+
+  const raw = await SubjectModel.find()
+    .sort({ title: 1 })
+    .select("title isPublished")
+    .populate({ path: "topics", options: { sort: { name: 1 } } })
+    .lean();
+
+  const subjects = normalizeIds(raw) as unknown as Array<{
+    id: string;
+    title: string;
+    isPublished: boolean;
+    topics: Array<{ id: string; name: string; description: string | null }>;
+  }>;
+
+  // Every topic across every subject is counted in one pass, so adding a subject doesn't
+  // add a query — this page renders the whole tree at once.
+  const questionCounts = await countByParent(
+    QuestionModel,
+    "topicId",
+    subjects.flatMap((subject) => (subject.topics ?? []).map((topic) => topic.id))
+  );
 
   return (
     <div>
@@ -46,11 +62,11 @@ export default async function AdminTopicsPage() {
       ) : (
         <div className="space-y-6">
           {subjects.map((subject) => {
-            const topics: TopicRow[] = subject.topics.map((topic) => ({
+            const topics: TopicRow[] = (subject.topics ?? []).map((topic) => ({
               id: topic.id,
               name: topic.name,
               description: topic.description,
-              questionCount: topic._count.questions,
+              questionCount: questionCounts.get(topic.id) ?? 0,
             }));
 
             return (

@@ -10,9 +10,12 @@ import {
   Users,
 } from "lucide-react";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import { normalizeIds } from "@/lib/serialize";
+import { ExamAttemptModel, QuestionModel, SubjectModel } from "@/models";
 import { requireAdmin } from "@/lib/rbac";
 import { getPlatformOverview, getSubjectStats } from "@/server/services/analytics";
+import { countByParent } from "@/server/services/counts";
 import { PageHeader } from "@/components/layout/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -34,28 +37,39 @@ function formatDateTime(value: Date) {
 export default async function AdminDashboardPage() {
   await requireAdmin();
 
-  const [overview, subjectStats, recentAttempts, draftSubjects] = await Promise.all([
+  await connectToDatabase();
+
+  const [overview, subjectStats, recentAttemptsRaw, draftSubjectsRaw] = await Promise.all([
     getPlatformOverview(),
     getSubjectStats(),
-    prisma.examAttempt.findMany({
-      orderBy: { startedAt: "desc" },
-      take: 6,
-      include: {
-        user: { select: { name: true, email: true } },
-        subject: { select: { id: true, title: true, passMark: true } },
-      },
-    }),
-    prisma.subject.findMany({
-      where: { isPublished: false },
-      orderBy: { updatedAt: "desc" },
-      take: 5,
-      select: {
-        id: true,
-        title: true,
-        _count: { select: { questions: true } },
-      },
-    }),
+    ExamAttemptModel.find()
+      .sort({ startedAt: -1 })
+      .limit(6)
+      .populate({ path: "user", select: "name email" })
+      .populate({ path: "subject", select: "title passMark" })
+      .lean(),
+    SubjectModel.find({ isPublished: false }).sort({ updatedAt: -1 }).limit(5).select("title").lean(),
   ]);
+
+  const recentAttempts = normalizeIds(recentAttemptsRaw) as unknown as Array<{
+    id: string;
+    attemptNumber: number;
+    percentage: number | null;
+    startedAt: Date;
+    user: { name: string | null; email: string } | null;
+    subject: { id: string; title: string; passMark: number } | null;
+  }>;
+
+  const draftSubjects = normalizeIds(draftSubjectsRaw) as unknown as Array<{
+    id: string;
+    title: string;
+  }>;
+
+  const draftQuestionCounts = await countByParent(
+    QuestionModel,
+    "subjectId",
+    draftSubjects.map((subject) => subject.id)
+  );
 
   const busiest = [...subjectStats]
     .filter((stat) => stat.attemptCount > 0)
@@ -147,19 +161,21 @@ export default async function AdminDashboardPage() {
               ) : (
                 <ul className="divide-y divide-border">
                   {recentAttempts.map((attempt) => {
+                    // Populated virtuals can be null where a SQL foreign key could not.
                     const passed =
                       attempt.percentage !== null &&
+                      attempt.subject !== null &&
                       attempt.percentage >= attempt.subject.passMark;
 
                     return (
                       <li key={attempt.id} className="flex items-center gap-3 py-3 first:pt-0">
                         <div className="min-w-0 flex-1">
                           <p className="truncate text-sm font-medium">
-                            {attempt.user.name ?? attempt.user.email}
+                            {attempt.user?.name ?? attempt.user?.email ?? "Deleted user"}
                           </p>
                           <p className="truncate text-xs text-muted-foreground">
-                            {attempt.subject.title} · attempt {attempt.attemptNumber} ·{" "}
-                            {formatDateTime(attempt.startedAt)}
+                            {attempt.subject?.title ?? "Deleted subject"} · attempt{" "}
+                            {attempt.attemptNumber} · {formatDateTime(attempt.startedAt)}
                           </p>
                         </div>
                         {attempt.percentage === null ? (
@@ -223,23 +239,25 @@ export default async function AdminDashboardPage() {
                   </p>
                 ) : (
                   <ul className="space-y-3">
-                    {draftSubjects.map((subject) => (
-                      <li key={subject.id} className="flex items-center gap-3">
-                        <Link
-                          href={`/admin/subjects/${subject.id}`}
-                          className="min-w-0 flex-1 truncate text-sm font-medium hover:text-primary hover:underline"
-                        >
-                          {subject.title}
-                        </Link>
-                        <Badge variant={subject._count.questions > 0 ? "warning" : "outline"}>
-                          {subject._count.questions === 0
-                            ? "No questions"
-                            : `${subject._count.questions} question${
-                                subject._count.questions === 1 ? "" : "s"
-                              }`}
-                        </Badge>
-                      </li>
-                    ))}
+                    {draftSubjects.map((subject) => {
+                      const questionCount = draftQuestionCounts.get(subject.id) ?? 0;
+
+                      return (
+                        <li key={subject.id} className="flex items-center gap-3">
+                          <Link
+                            href={`/admin/subjects/${subject.id}`}
+                            className="min-w-0 flex-1 truncate text-sm font-medium hover:text-primary hover:underline"
+                          >
+                            {subject.title}
+                          </Link>
+                          <Badge variant={questionCount > 0 ? "warning" : "outline"}>
+                            {questionCount === 0
+                              ? "No questions"
+                              : `${questionCount} question${questionCount === 1 ? "" : "s"}`}
+                          </Badge>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </CardContent>

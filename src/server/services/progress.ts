@@ -1,5 +1,8 @@
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import { normalizeIds } from "@/lib/serialize";
+import { ExamAttemptModel, QuestionModel, SubjectModel } from "@/models";
 import { secondsRemaining, STUDENT_SUBJECT_FILTER } from "@/server/services/attempts";
+import type { AttemptStatus } from "@/types/models";
 
 /**
  * Student-facing progress reads for the dashboard and history pages.
@@ -9,7 +12,7 @@ import { secondsRemaining, STUDENT_SUBJECT_FILTER } from "@/server/services/atte
  *
  * `UserProgress` is the denormalised cache that grading maintains; these reads go to
  * `ExamAttempt` directly because the dashboard needs per-attempt ordering for the trend,
- * which the aggregate row can't express.
+ * which the aggregate document can't express.
  */
 
 export type TrendPoint = {
@@ -81,7 +84,7 @@ function mean(values: number[]) {
 export type AttemptHistoryRow = {
   attemptId: string;
   attemptNumber: number;
-  status: "IN_PROGRESS" | "SUBMITTED" | "ABANDONED";
+  status: AttemptStatus;
   subjectId: string;
   subjectTitle: string;
   subjectSlug: string;
@@ -99,93 +102,126 @@ export type AttemptHistoryRow = {
   passed: boolean | null;
 };
 
+type HistoryRow = {
+  id: string;
+  attemptNumber: number;
+  status: AttemptStatus;
+  percentage: number | null;
+  score: number | null;
+  totalPoints: number | null;
+  correctCount: number | null;
+  incorrectCount: number | null;
+  unansweredCount: number | null;
+  timeSpentSec: number | null;
+  isAutoSubmitted: boolean;
+  startedAt: Date;
+  submittedAt: Date | null;
+  subject: { id: string; title: string; slug: string; passMark: number } | null;
+};
+
 /** Every attempt this student has ever made, newest first. */
 export async function getAttemptHistory(userId: string): Promise<AttemptHistoryRow[]> {
-  const attempts = await prisma.examAttempt.findMany({
-    where: { userId },
-    orderBy: [{ startedAt: "desc" }],
-    select: {
-      id: true,
-      attemptNumber: true,
-      status: true,
-      percentage: true,
-      score: true,
-      totalPoints: true,
-      correctCount: true,
-      incorrectCount: true,
-      unansweredCount: true,
-      timeSpentSec: true,
-      isAutoSubmitted: true,
-      startedAt: true,
-      submittedAt: true,
-      subject: { select: { id: true, title: true, slug: true, passMark: true } },
-    },
-  });
+  await connectToDatabase();
 
-  return attempts.map((attempt) => ({
-    attemptId: attempt.id,
-    attemptNumber: attempt.attemptNumber,
-    status: attempt.status,
-    subjectId: attempt.subject.id,
-    subjectTitle: attempt.subject.title,
-    subjectSlug: attempt.subject.slug,
-    passMark: attempt.subject.passMark,
-    percentage: attempt.percentage,
-    score: attempt.score,
-    totalPoints: attempt.totalPoints,
-    correctCount: attempt.correctCount,
-    incorrectCount: attempt.incorrectCount,
-    unansweredCount: attempt.unansweredCount,
-    timeSpentSec: attempt.timeSpentSec,
-    isAutoSubmitted: attempt.isAutoSubmitted,
-    startedAt: attempt.startedAt,
-    submittedAt: attempt.submittedAt,
-    passed:
-      attempt.status === "SUBMITTED"
-        ? (attempt.percentage ?? 0) >= attempt.subject.passMark
-        : null,
-  }));
+  const raw = await ExamAttemptModel.find({ userId })
+    .sort({ startedAt: -1 })
+    .populate({ path: "subject", select: "title slug passMark" })
+    .lean();
+
+  const attempts = normalizeIds(raw) as unknown as HistoryRow[];
+
+  return attempts
+    // A subject hard-deleted from under an attempt leaves nothing to name the row with.
+    .filter((attempt) => attempt.subject !== null)
+    .map((attempt) => ({
+      attemptId: attempt.id,
+      attemptNumber: attempt.attemptNumber,
+      status: attempt.status,
+      subjectId: attempt.subject!.id,
+      subjectTitle: attempt.subject!.title,
+      subjectSlug: attempt.subject!.slug,
+      passMark: attempt.subject!.passMark,
+      percentage: attempt.percentage,
+      score: attempt.score,
+      totalPoints: attempt.totalPoints,
+      correctCount: attempt.correctCount,
+      incorrectCount: attempt.incorrectCount,
+      unansweredCount: attempt.unansweredCount,
+      timeSpentSec: attempt.timeSpentSec,
+      isAutoSubmitted: attempt.isAutoSubmitted,
+      startedAt: attempt.startedAt,
+      submittedAt: attempt.submittedAt,
+      passed:
+        attempt.status === "SUBMITTED"
+          ? (attempt.percentage ?? 0) >= attempt.subject!.passMark
+          : null,
+    }));
+}
+
+type SubmittedRow = {
+  id: string;
+  attemptNumber: number;
+  percentage: number | null;
+  submittedAt: Date | null;
+  subject: {
+    id: string;
+    title: string;
+    slug: string;
+    passMark: number;
+    isPublished: boolean;
+    isActive: boolean;
+  };
+};
+
+type InProgressRow = {
+  id: string;
+  attemptNumber: number;
+  startedAt: Date;
+  subject: { title: string; slug: string; durationMin: number };
+  answers: Array<{ answeredAt: Date | null }>;
+};
+
+/**
+ * Counts subjects a student could actually start right now.
+ *
+ * Prisma expressed "has at least one active question" as a relational `some` subquery.
+ * MongoDB has no joins in a count, so the subject ids that own an active question are
+ * collected first and used as an `$in`. `distinct` returns unique values, so the list
+ * stays one entry per subject however large the question bank grows.
+ */
+async function countAvailableSubjects(): Promise<number> {
+  const subjectIdsWithQuestions = await QuestionModel.distinct("subjectId", { isActive: true });
+
+  return SubjectModel.countDocuments({
+    ...STUDENT_SUBJECT_FILTER,
+    _id: { $in: subjectIdsWithQuestions },
+  });
 }
 
 /** Dashboard payload: headline stats, resumable attempts, trend, and per-subject rows. */
 export async function getStudentOverview(userId: string): Promise<StudentOverview> {
-  const [submitted, inProgress, subjectsAvailable] = await Promise.all([
-    prisma.examAttempt.findMany({
-      where: { userId, status: "SUBMITTED" },
-      orderBy: [{ submittedAt: "asc" }],
-      select: {
-        id: true,
-        attemptNumber: true,
-        percentage: true,
-        submittedAt: true,
-        subject: {
-          select: {
-            id: true,
-            title: true,
-            slug: true,
-            passMark: true,
-            isPublished: true,
-            isActive: true,
-          },
-        },
-      },
-    }),
-    prisma.examAttempt.findMany({
-      where: { userId, status: "IN_PROGRESS" },
-      orderBy: { startedAt: "desc" },
-      select: {
-        id: true,
-        attemptNumber: true,
-        startedAt: true,
-        subject: { select: { title: true, slug: true, durationMin: true } },
-        // Small by construction — one row per question in the attempt.
-        answers: { select: { answeredAt: true } },
-      },
-    }),
-    prisma.subject.count({
-      where: { ...STUDENT_SUBJECT_FILTER, questions: { some: { isActive: true } } },
-    }),
+  await connectToDatabase();
+
+  const [submittedRaw, inProgressRaw, subjectsAvailable] = await Promise.all([
+    ExamAttemptModel.find({ userId, status: "SUBMITTED" })
+      .sort({ submittedAt: 1 })
+      .populate({ path: "subject", select: "title slug passMark isPublished isActive" })
+      .lean(),
+    ExamAttemptModel.find({ userId, status: "IN_PROGRESS" })
+      .sort({ startedAt: -1 })
+      .populate({ path: "subject", select: "title slug durationMin" })
+      // Small by construction — one document per question in the attempt.
+      .populate({ path: "answers", select: "answeredAt" })
+      .lean(),
+    countAvailableSubjects(),
   ]);
+
+  const submitted = (normalizeIds(submittedRaw) as unknown as SubmittedRow[]).filter(
+    (attempt) => attempt.subject !== null
+  );
+  const inProgress = (normalizeIds(inProgressRaw) as unknown as InProgressRow[]).filter(
+    (attempt) => attempt.subject !== null
+  );
 
   const trend: TrendPoint[] = submitted.map((attempt, index) => {
     const percentage = attempt.percentage ?? 0;
@@ -253,8 +289,8 @@ export async function getStudentOverview(userId: string): Promise<StudentOvervie
     attemptNumber: attempt.attemptNumber,
     startedAt: attempt.startedAt,
     secondsRemaining: secondsRemaining(attempt.startedAt, attempt.subject.durationMin),
-    answered: attempt.answers.filter((answer) => answer.answeredAt !== null).length,
-    total: attempt.answers.length,
+    answered: (attempt.answers ?? []).filter((answer) => answer.answeredAt !== null).length,
+    total: (attempt.answers ?? []).length,
   }));
 
   return {

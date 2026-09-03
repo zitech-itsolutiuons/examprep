@@ -5,21 +5,26 @@ exams per subject with autosave, flagging, and server-graded results including a
 per-question review and correction. Admins manage subjects, topics, questions, and
 analytics.
 
-**Stack:** Next.js 14 (App Router) · TypeScript · Tailwind CSS · shadcn/ui · PostgreSQL · Prisma · NextAuth.js
+**Stack:** Next.js 14 (App Router) · TypeScript · Tailwind CSS · shadcn/ui · MongoDB · Mongoose · NextAuth.js
 
 ## Prerequisites
 - Node.js 18.18+ (20 LTS recommended)
-- **A running PostgreSQL 14+ instance** — a local install, Docker, or a hosted one
-  (Neon / Supabase / Railway). Nothing below works until Postgres is reachable.
+- **A reachable MongoDB 6+ deployment** — local, Docker, or Atlas. Nothing below works until
+  Mongo answers.
+- It must be a **replica set**, not a standalone `mongod`. Starting an exam and submitting one
+  are multi-document transactions, and transactions need a replica set. A single-node replica
+  set is fine, and Atlas clusters already are one.
 
 <details>
-<summary>Quickest local Postgres via Docker</summary>
+<summary>Quickest local MongoDB via Docker</summary>
 
 ```bash
-docker run --name examprep-db -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=examprep -p 5432:5432 -d postgres:16
+docker run --name examprep-db -p 27017:27017 -d mongo:7 --replSet rs0
+docker exec examprep-db mongosh --eval 'rs.initiate()'
 ```
-This matches the default `DATABASE_URL` in `.env.example`.
+This matches the default `MONGODB_URI` in `.env.example`. The `rs.initiate()` is what makes it
+a replica set — skip it and every exam start fails with *"Transaction numbers are only allowed
+on a replica set member or mongos"*.
 </details>
 
 ## Setup
@@ -34,32 +39,29 @@ This matches the default `DATABASE_URL` in `.env.example`.
    cp .env.example .env
    ```
    Fill in:
-   - `DATABASE_URL` — your Postgres connection string
+   - `MONGODB_URI` — your connection string, **including the database name** in the path.
+     Without one, Mongoose silently uses a database called `test`.
    - `NEXTAUTH_SECRET` — generate with `openssl rand -base64 32`
    - `EMAIL_*` — SMTP credentials for password-reset emails. Without them the app still
      runs; reset links are logged to the server console instead of being sent.
 
-3. **Create the database schema**
-   ```bash
-   npm run db:migrate
-   ```
-   An initial migration is committed at `prisma/migrations/0_init`, so this creates every
-   table and records the migration. Prisma creates the database itself if it doesn't exist
-   yet. (`npm run db:push` also works and skips migration history — fine for prototyping,
-   but prefer `db:migrate` so schema changes stay versioned.)
-
-4. **Seed demo data**
+3. **Seed demo data**
    ```bash
    npm run db:seed
    ```
-   `npm run db:reset` drops everything, re-applies the migration, and reseeds in one step —
-   useful for getting back to a clean demo state.
+   There is no schema step. MongoDB creates collections on first write, and the Mongoose
+   schemas in `src/models` are enforced by the application rather than the server — so seeding
+   an empty database is all the setup there is.
 
-5. **Run the dev server**
+   `npm run db:reset` drops every collection and reseeds, for getting back to a clean demo
+   state. It refuses to run against a non-local `MONGODB_URI` unless you add `-- --force`.
+
+4. **Run the dev server**
    ```bash
    npm run dev
    ```
    App runs at http://localhost:3000
+
 
 ### Demo accounts
 
@@ -94,23 +96,38 @@ Landing-page blocks are only inserted when a section is completely empty, so re-
 never duplicates or overwrites copy an admin has edited.
 
 ## Useful scripts
-| Command              | Purpose                                       |
-|----------------------|-----------------------------------------------|
-| `npm run dev`        | Start the dev server                          |
-| `npm run build`      | Production build                              |
-| `npm run start`      | Run the production build                      |
-| `npm run lint`       | ESLint                                        |
-| `npm run db:push`    | Push the schema without a migration           |
-| `npm run db:migrate` | Create and apply a dev migration              |
-| `npm run db:seed`    | Seed demo data                                |
-| `npm run db:studio`  | Open Prisma Studio (DB GUI)                   |
-| `npm run db:reset`   | Drop, re-apply migrations, and reseed         |
+| Command               | Purpose                                              |
+|-----------------------|------------------------------------------------------|
+| `npm run dev`         | Start the dev server                                 |
+| `npm run build`       | Production build                                     |
+| `npm run start`       | Run the production build                             |
+| `npm run lint`        | ESLint                                               |
+| `npm run db:seed`     | Seed demo data (re-runnable)                         |
+| `npm run db:reset`    | Drop every collection and reseed                     |
+| `npm run db:indexes`  | Build the indexes the schemas declare, and list them |
 
-> The seed is also registered under the `prisma.seed` key in `package.json`, so
-> `npx prisma db seed` works and `db:reset` reseeds automatically.
+> `db:reset` is the only destructive one, and it refuses a non-local `MONGODB_URI` unless you
+> pass `-- --force`. It drops *collections*, not the database, so Atlas database users and
+> their grants survive.
+>
+> `db:indexes` is worth running once against a fresh Atlas database. Mongoose builds declared
+> indexes on first use, but it reports a failure by emitting an event rather than throwing — so
+> a unique index that can't be built is otherwise silent, and several of this app's guarantees
+> (idempotent autosave, duplicate-email 409s, the guest redemption cap) *are* unique indexes.
+>
+> The scripts in `scripts/` load `.env` through `@next/env`, so they resolve the same
+> connection string the app does. Prisma used to do this implicitly; nothing does it for a
+> plain `tsx` process, which is what `scripts/env.ts` exists for.
 
 ## Gotchas worth knowing
 
+- **A standalone `mongod` is not enough.** Starting and submitting an exam are multi-document
+  transactions, which MongoDB only allows on a replica set. Against a plain `mongod` those two
+  paths fail with *"Transaction numbers are only allowed on a replica set member or mongos"*
+  while everything else appears to work. Run a single-node replica set locally, or use Atlas.
+- **`MONGODB_URI` must name a database.** `mongodb://127.0.0.1:27017` without a path connects to
+  a database literally called `test`. Nothing errors — you just seed and read one database while
+  looking at another.
 - **The in-progress demo attempt expires.** The seed leaves Grace one live Basic Computer
   Science attempt so the resume path is visible, but that subject's limit is 20 minutes —
   measured from when you seeded. Open `/exam/...` after that and the server closes the
@@ -194,24 +211,40 @@ layout, and the build plan.
   success and inline `<Alert>` for validation errors.
 
 ## Database schema
-Defined in [`prisma/schema.prisma`](./prisma/schema.prisma):
+Defined as Mongoose schemas in [`src/models/index.ts`](./src/models/index.ts), with the
+matching TypeScript shapes in [`src/types/models.ts`](./src/types/models.ts). The two are kept
+in step by hand — the schemas are the runtime shape, the types are the compile-time shape, and
+nothing checks that they agree.
 
-- **User** — students & admins, role-based (`STUDENT` / `ADMIN`)
-- **Session / PasswordResetToken** — auth support tables
+- **User** — students, admins & guests, role-based (`STUDENT` / `ADMIN` / `GUEST`)
+- **Session / PasswordResetToken** — auth support collections
 - **Subject** — exam subjects, with publish/active flags, duration, pass mark
 - **Topic** — categories within a subject
 - **Question / QuestionOption** — question bank with correct-answer flags & explanations
-- **ExamAttempt** — one row per attempt; retakes create new rows, old ones are preserved
-- **UserAnswer** — one row per question per attempt, written when the attempt starts;
+- **ExamAttempt** — one document per attempt; retakes create new ones, old ones are preserved
+- **UserAnswer** — one document per question per attempt, written when the attempt starts;
   `isCorrect` is `true` / `false` / `null` for unanswered
 - **FlaggedQuestion** — questions a student marked for review mid-exam
 - **UserProgress** — denormalised best/average score per user+subject for fast dashboards
-- **HomePage** — the landing page's one-off copy; a single row, always id `"home"`
+- **HomePage** — the landing page's one-off copy; a single document, always id `"home"`
 - **HomeBlock** — the landing page's repeated items (stats, features, steps, FAQ entries,
-  footer links) in one table, discriminated by `kind`, each with an order and a visibility flag
-- **GuestAccessCode** — the rotating code for account-free practice; a single row holding the
-  current code, its expiry, and the revocation counter
+  footer links) in one collection, discriminated by `kind`, each with an order and a visibility flag
+- **GuestAccessCode** — the rotating code for account-free practice; a single document holding
+  the current code, its expiry, and the revocation counter
 - **AuditLog** — admin action trail
+
+Three conventions in `src/models/index.ts` carry the whole data layer, and breaking any of them
+breaks call sites far from that file:
+
+- **Primary keys are strings, not `ObjectId`.** Ids arrive from URL params and form bodies, and
+  Mongoose throws a `CastError` on a malformed `ObjectId` — so a junk id in a URL would 500
+  where a missing row should 404. A `String` `_id` cannot fail to cast.
+- **Foreign keys are scalars; relations are virtuals.** `question.subjectId` stays a string and
+  `.populate("subject")` fills `question.subject` alongside it, which is the shape the app was
+  already written against.
+- **There is no referential integrity.** MongoDB has no `ON DELETE`, so the cascades the SQL
+  schema enforced live in [`src/server/services/cascade.ts`](./src/server/services/cascade.ts)
+  and must be called on every delete path. Nothing catches a missed one.
 
 ## Security model
 

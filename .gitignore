@@ -17,9 +17,6 @@
 *.pem
 npm-debug.log*
 
-# prisma
-/prisma/migrations/dev/
-
 # typescript
 *.tsbuildinfo
 next-env.d.ts

@@ -1,10 +1,17 @@
 import { NextResponse } from "next/server";
-import type { Prisma } from "@prisma/client";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import { normalizeIds } from "@/lib/serialize";
 import { requireApiAdmin } from "@/lib/rbac";
+import { ExamAttemptModel, UserModel } from "@/models";
+import { attachCounts, countByParent } from "@/server/services/counts";
 
 const PAGE_SIZE = 25;
+
+/** Escapes regex metacharacters so a search term is matched literally. */
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 export async function GET(req: Request) {
   const auth = await requireApiAdmin();
@@ -16,40 +23,45 @@ export async function GET(req: Request) {
   const status = params.get("status");
   const page = Math.max(1, Number(params.get("page") ?? 1) || 1);
 
-  const where: Prisma.UserWhereInput = {
+  // Prisma's `contains` with `mode: "insensitive"` becomes an escaped case-insensitive
+  // regex; `OR` becomes `$or`, and `{ not: "GUEST" }` becomes `$ne`.
+  const filter: Record<string, unknown> = {
     ...(search
       ? {
-          OR: [
-            { name: { contains: search, mode: "insensitive" } },
-            { email: { contains: search, mode: "insensitive" } },
+          $or: [
+            { name: { $regex: escapeRegex(search), $options: "i" } },
+            { email: { $regex: escapeRegex(search), $options: "i" } },
           ],
         }
       : {}),
     // Guest rows are sessions, not accounts — excluded here for the same reason as on the
     // users page. A `role` filter still narrows within the real accounts.
-    role: role === "ADMIN" || role === "STUDENT" ? role : { not: "GUEST" },
+    role: role === "ADMIN" || role === "STUDENT" ? role : { $ne: "GUEST" },
     ...(status === "active" ? { isActive: true } : {}),
     ...(status === "inactive" ? { isActive: false } : {}),
   };
 
-  const [users, total] = await Promise.all([
-    prisma.user.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
-      skip: (page - 1) * PAGE_SIZE,
-      take: PAGE_SIZE,
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        role: true,
-        isActive: true,
-        createdAt: true,
-        _count: { select: { attempts: true } },
-      },
-    }),
-    prisma.user.count({ where }),
+  await connectToDatabase();
+
+  const [raw, total] = await Promise.all([
+    UserModel.find(filter)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * PAGE_SIZE)
+      .limit(PAGE_SIZE)
+      .select("name email role isActive createdAt")
+      .lean(),
+    UserModel.countDocuments(filter),
   ]);
+
+  const rows = normalizeIds(raw) as unknown as Array<Record<string, unknown> & { id: string }>;
+
+  const attemptCounts = await countByParent(
+    ExamAttemptModel,
+    "userId",
+    rows.map((user) => user.id)
+  );
+
+  const users = attachCounts(rows, { attempts: attemptCounts }).map(({ _id, ...user }) => user);
 
   return NextResponse.json({
     users,

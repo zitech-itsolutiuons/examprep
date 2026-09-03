@@ -60,7 +60,14 @@
       "Bash(curl -s -o /dev/null -b gj.txt http://localhost:3000/dashboard)",
       "Bash(curl -s -o /dev/null -b gj.txt http://localhost:3000/profile)",
       "Bash(rm -f next.config.js.utf16.bak vercel.json.utf16.bak)",
-      "Bash(curl -s -o /dev/null http://localhost:3000/dashboard)"
+      "Bash(curl -s -o /dev/null http://localhost:3000/dashboard)",
+      "Bash(rm -f vercel.json)",
+      "Bash(mkdir -p public)",
+      "Bash(touch public/.gitkeep)",
+      "Bash(node -e \"const p=require\\('./package.json'\\); console.log\\('package.json OK'\\); console.log\\(JSON.stringify\\(p.scripts,null,2\\)\\)\")",
+      "PowerShell(\\(Get-Content prisma/seed.ts | Measure-Object -Line\\).Lines; Get-ChildItem prisma | Select-Object Name, Length)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(awk '{print $2}')"
     ]
   }
 }

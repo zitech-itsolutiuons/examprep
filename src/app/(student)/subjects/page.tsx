@@ -1,7 +1,9 @@
 import Link from "next/link";
 import { BookOpen, Clock, FileQuestion, Target } from "lucide-react";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import { normalizeIds } from "@/lib/serialize";
+import { ExamAttemptModel, QuestionModel, SubjectModel, UserProgressModel } from "@/models";
 import { requireUser } from "@/lib/rbac";
 import { PageHeader } from "@/components/layout/page-header";
 import { Badge } from "@/components/ui/badge";
@@ -9,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { STUDENT_SUBJECT_FILTER } from "@/server/services/attempts";
+import { countByParent } from "@/server/services/counts";
 
 export const metadata = { title: "Subjects" };
 export const dynamic = "force-dynamic";
@@ -16,35 +19,49 @@ export const dynamic = "force-dynamic";
 export default async function SubjectsPage() {
   const user = await requireUser();
 
+  await connectToDatabase();
+
   // Only published + active subjects are ever queried, so an unpublished subject is
   // invisible here rather than merely unclickable.
-  const subjects = await prisma.subject.findMany({
-    where: STUDENT_SUBJECT_FILTER,
-    orderBy: { title: "asc" },
-    select: {
-      id: true,
-      slug: true,
-      title: true,
-      description: true,
-      durationMin: true,
-      passMark: true,
-      _count: { select: { questions: { where: { isActive: true } } } },
-    },
-  });
+  const raw = await SubjectModel.find(STUDENT_SUBJECT_FILTER)
+    .sort({ title: 1 })
+    .select("slug title description durationMin passMark")
+    .lean();
 
-  const progress = await prisma.userProgress.findMany({
-    where: { userId: user.id },
-    select: { subjectId: true, attemptsCount: true, bestPercentage: true },
-  });
+  const subjects = normalizeIds(raw) as unknown as Array<{
+    id: string;
+    slug: string;
+    title: string;
+    description: string | null;
+    durationMin: number;
+    passMark: number;
+  }>;
+
+  // Was `_count: { questions: { where: { isActive: true } } }` — one grouped count for the
+  // whole page instead of a subquery per subject.
+  const questionCounts = await countByParent(
+    QuestionModel,
+    "subjectId",
+    subjects.map((subject) => subject.id),
+    { isActive: true }
+  );
+
+  const progress = await UserProgressModel.find({ userId: user.id })
+    .select("subjectId attemptsCount bestPercentage")
+    .lean();
   const progressBySubject = new Map(progress.map((row) => [row.subjectId, row]));
 
-  const inProgress = await prisma.examAttempt.findMany({
-    where: { userId: user.id, status: "IN_PROGRESS" },
-    select: { id: true, subjectId: true },
-  });
-  const liveAttempt = new Map(inProgress.map((attempt) => [attempt.subjectId, attempt.id]));
+  const inProgress = await ExamAttemptModel.find({ userId: user.id, status: "IN_PROGRESS" })
+    .select("subjectId")
+    .lean();
+  const liveAttempt = new Map(
+    inProgress.map((attempt) => [attempt.subjectId, String(attempt._id)])
+  );
 
-  const available = subjects.filter((subject) => subject._count.questions > 0);
+  const available = subjects.flatMap((subject) => {
+    const questionCount = questionCounts.get(subject.id) ?? 0;
+    return questionCount > 0 ? [{ ...subject, questionCount }] : [];
+  });
 
   return (
     <div>
@@ -84,7 +101,7 @@ export default async function SubjectsPage() {
                         <FileQuestion className="h-3 w-3" />
                         Questions
                       </dt>
-                      <dd className="font-medium tabular-nums">{subject._count.questions}</dd>
+                      <dd className="font-medium tabular-nums">{subject.questionCount}</dd>
                     </div>
                     <div className="space-y-1">
                       <dt className="flex items-center gap-1 text-muted-foreground">

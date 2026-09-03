@@ -10,7 +10,9 @@ import {
   Users,
 } from "lucide-react";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import { normalizeIds } from "@/lib/serialize";
+import { ExamAttemptModel, QuestionModel, SubjectModel } from "@/models";
 import { requireAdmin } from "@/lib/rbac";
 import { PageHeader } from "@/components/layout/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -20,43 +22,59 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { StatCard } from "@/components/ui/stat-card";
 import { SubjectDetailActions } from "@/components/admin/subject-detail-actions";
 import { TopicManager, type TopicRow } from "@/components/admin/topic-manager";
+import { countByParent } from "@/server/services/counts";
 
 type Params = { params: { id: string } };
 
 export async function generateMetadata({ params }: Params) {
-  const subject = await prisma.subject.findUnique({
-    where: { id: params.id },
-    select: { title: true },
-  });
+  await connectToDatabase();
+  const subject = await SubjectModel.findOne({ _id: params.id }).select("title").lean();
   return { title: subject?.title ?? "Subject" };
 }
 
 export default async function AdminSubjectDetailPage({ params }: Params) {
   await requireAdmin();
 
-  const subject = await prisma.subject.findUnique({
-    where: { id: params.id },
-    include: {
-      createdBy: { select: { name: true, email: true } },
-      topics: {
-        orderBy: { name: "asc" },
-        include: { _count: { select: { questions: true } } },
-      },
-      _count: { select: { questions: true, attempts: true } },
-    },
-  });
+  await connectToDatabase();
 
-  if (!subject) notFound();
+  const raw = await SubjectModel.findOne({ _id: params.id })
+    .populate({ path: "createdBy", select: "name email" })
+    .populate({ path: "topics", options: { sort: { name: 1 } } })
+    .lean();
 
-  const activeQuestions = await prisma.question.count({
-    where: { subjectId: subject.id, isActive: true },
-  });
+  if (!raw) notFound();
 
-  const topics: TopicRow[] = subject.topics.map((topic) => ({
+  const subject = normalizeIds(raw) as unknown as {
+    id: string;
+    title: string;
+    slug: string;
+    description: string | null;
+    imageUrl: string | null;
+    durationMin: number;
+    passMark: number;
+    isPublished: boolean;
+    isActive: boolean;
+    createdAt: Date;
+    createdBy: { name: string | null; email: string } | null;
+    topics: Array<{ id: string; name: string; description: string | null }>;
+  };
+
+  const [questionCount, attemptCount, activeQuestions, topicQuestionCounts] = await Promise.all([
+    QuestionModel.countDocuments({ subjectId: subject.id }),
+    ExamAttemptModel.countDocuments({ subjectId: subject.id }),
+    QuestionModel.countDocuments({ subjectId: subject.id, isActive: true }),
+    countByParent(
+      QuestionModel,
+      "topicId",
+      (subject.topics ?? []).map((topic) => topic.id)
+    ),
+  ]);
+
+  const topics: TopicRow[] = (subject.topics ?? []).map((topic) => ({
     id: topic.id,
     name: topic.name,
     description: topic.description,
-    questionCount: topic._count.questions,
+    questionCount: topicQuestionCounts.get(topic.id) ?? 0,
   }));
 
   return (
@@ -124,12 +142,12 @@ export default async function AdminSubjectDetailPage({ params }: Params) {
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <StatCard
             label="Questions"
-            value={subject._count.questions}
+            value={questionCount}
             hint={`${activeQuestions} active`}
             icon={FileQuestion}
           />
           <StatCard label="Topics" value={topics.length} icon={Tags} />
-          <StatCard label="Attempts" value={subject._count.attempts} icon={Users} />
+          <StatCard label="Attempts" value={attemptCount} icon={Users} />
           <StatCard
             label="Duration"
             value={`${subject.durationMin}m`}
@@ -158,7 +176,7 @@ export default async function AdminSubjectDetailPage({ params }: Params) {
               <dl className="grid gap-4 text-sm sm:grid-cols-2">
                 <div>
                   <dt className="text-muted-foreground">Total questions</dt>
-                  <dd className="font-medium tabular-nums">{subject._count.questions}</dd>
+                  <dd className="font-medium tabular-nums">{questionCount}</dd>
                 </div>
                 <div>
                   <dt className="text-muted-foreground">Active questions</dt>

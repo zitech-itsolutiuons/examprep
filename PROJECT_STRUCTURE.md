@@ -4,7 +4,7 @@ This file tracks the intended structure so each step slots into the right place.
 Folders already exist in the repo; files inside them are added step by step.
 
 ## Stack
-Next.js 14 (App Router) · TypeScript · Tailwind CSS · shadcn/ui · PostgreSQL · Prisma · NextAuth.js
+Next.js 14 (App Router) · TypeScript · Tailwind CSS · shadcn/ui · MongoDB · Mongoose · NextAuth.js
 
 ## Route map
 
@@ -68,15 +68,27 @@ src/server/
 │  ├─ home.ts       landing-page content: defaults, live stat metrics, settings upsert
 │  ├─ guest-access.ts  rotating code: cached reads, lazy roll, redemption, retention
 │  ├─ analytics.ts  admin statistics
+│  ├─ cascade.ts    manual delete cascades — MongoDB has no ON DELETE
+│  ├─ counts.ts     related-document counts (replaces Prisma's `_count`)
 │  └─ audit.ts      non-throwing AuditLog writer
 └─ validators/      # zod schemas shared by API routes + forms
+src/models/
+└─ index.ts         # Mongoose schemas + model registration (the schema of record)
+src/types/
+└─ models.ts        # hand-written document types + enum unions
 src/lib/
-├─ prisma.ts        # PrismaClient singleton
+├─ mongoose.ts      # cached connection, withDb(), duplicate-key test
+├─ serialize.ts     # _id → id normalisation for lean reads and aggregates
 ├─ auth.ts          # NextAuth config (credentials provider, session callbacks)
 ├─ rbac.ts          # requireUser/requireAccount/requireAdmin (+ API equivalents)
 ├─ home-icons.ts    # allow-listed Lucide icons for landing-page blocks
 └─ utils.ts         # cn() and small helpers
 src/middleware.ts     # route protection — MUST be under src/, see the constraints below
+scripts/               # standalone tsx entry points (not part of the Next.js build)
+├─ env.ts            loads .env via @next/env — import first in every script here
+├─ seed.ts           re-runnable demo data; grades attempts through the real service
+├─ reset.ts          drops every collection and reseeds; refuses non-local URIs
+└─ indexes.ts        syncIndexes() across all models, then lists what exists
 ```
 
 ## UI layer
@@ -151,16 +163,16 @@ These protect the guarantee that past results stay reviewable forever:
 ## How the landing-page CMS is put together
 Four decisions that explain the shape of the code:
 
-- **One row for the one-off copy, one table for everything repeated.** `HomePage` is a
+- **One document for the one-off copy, one collection for everything repeated.** `HomePage` is a
   singleton (`id = "home"`); stats, features, steps, FAQ entries, and footer links are all
-  `HomeBlock` rows discriminated by `kind`. They share a shape — heading, body, position,
-  visibility — so one table means one admin API and one manager component instead of five
-  near-identical copies. Which optional columns matter per kind is enforced by zod, not by
+  `HomeBlock` documents discriminated by `kind`. They share a shape — heading, body, position,
+  visibility — so one collection means one admin API and one manager component instead of five
+  near-identical copies. Which optional fields matter per kind is enforced by zod, not by
   the schema, and `kind` is immutable: a block can't move between sections.
-- **`HOME_DEFAULTS` is the only copy of the shipped wording.** The `home_page` columns carry
-  no database defaults, so Prisma rejects a `create` that forgets a field. The public read is
-  pure — with no row it renders `HOME_DEFAULTS` in memory rather than inserting one, so an
-  anonymous page view never writes. The admin PATCH upserts, filling untouched fields from
+- **`HOME_DEFAULTS` is the only copy of the shipped wording.** The `home_page` fields carry
+  no schema defaults, so the shipped wording lives in one place instead of two. The public read
+  is pure — with no document it renders `HOME_DEFAULTS` in memory rather than inserting one, so
+  an anonymous page view never writes. The admin PATCH upserts, filling untouched fields from
   the same constant.
 - **Settings save one tab at a time.** `PATCH /api/admin/home` takes a partial body, so an
   admin editing the hero can't overwrite the FAQ heading with a stale value from when the tab
@@ -282,7 +294,7 @@ To confirm middleware is actually registered, build and check that
 server for a `Compiling /src/middleware` line. An empty manifest means it is not running.
 
 ## Build order (steps)
-1. ✅ Project scaffold + Prisma schema
+1. ✅ Project scaffold + database schema
 2. ✅ Auth: NextAuth credentials provider, register/login/logout, password reset, profile
    management, RBAC guards (`requireUser`/`requireAdmin` for pages, `requireApiUser`/
    `requireApiAdmin` for API routes), middleware-based route protection
@@ -310,7 +322,7 @@ server for a `Compiling /src/middleware` line. An empty manifest means it is not
 9. ✅ Dashboard + history: headline stats (average, best, pass rate, subjects attempted),
    resumable in-progress attempts, a dependency-free improvement-trend chart, per-subject
    breakdown, and a filterable full attempt history at `/history`
-10. ✅ Seed data (`prisma/seed.ts` — re-runnable, grades demo attempts through the real
+10. ✅ Seed data (`scripts/seed.ts` — re-runnable, grades demo attempts through the real
     grading service, and self-checks its content against the admin validator rules) +
     README rewrite covering setup, demo accounts, marking rules, and the security model
 11. ✅ Landing page rebuilt as admin-editable content — a stats band counted live from the

@@ -15,6 +15,23 @@ import { HomeCta } from "@/components/home/home-cta";
 import { HomeFooter } from "@/components/home/home-footer";
 
 /**
+ * Rendered per request, never prerendered.
+ *
+ * This page is already dynamic in practice — it reads the session to redirect signed-in
+ * visitors, and `searchParams` for `?preview` — so Next.js bails out of the static pass on
+ * its own. Declaring it removes a build-time race that bailout leaves behind: `next build`
+ * still *attempts* a prerender, and `generateMetadata` below opens a database connection
+ * while the page body is reaching for cookies. Whichever finishes first decides the build.
+ *
+ * A slow database failure loses that race harmlessly (the cookie bailout aborts the attempt),
+ * but a fast one — no `MONGODB_URI`, a bad host, a paused Atlas cluster — throws before the
+ * bailout and fails the whole build with an opaque "Error occurred prerendering page /".
+ * With `force-dynamic` there is no static pass, so a deploy no longer depends on the database
+ * being reachable from the build container.
+ */
+export const dynamic = "force-dynamic";
+
+/**
  * Title and description are admin-editable, falling through to the root layout's defaults
  * when left blank. The absolute form is used so the layout's "%s · ExamPrep" template
  * doesn't append the brand to a title an admin wrote in full.

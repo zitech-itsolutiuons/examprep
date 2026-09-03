@@ -12,7 +12,9 @@ import {
   Target,
 } from "lucide-react";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import { normalizeIds } from "@/lib/serialize";
+import { ExamAttemptModel, QuestionModel, SubjectModel } from "@/models";
 import { requireUser } from "@/lib/rbac";
 import { PageHeader } from "@/components/layout/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -23,16 +25,17 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { StatCard } from "@/components/ui/stat-card";
 import { StartExamButton } from "@/components/student/start-exam-button";
 import { STUDENT_SUBJECT_FILTER } from "@/server/services/attempts";
+import { countByParent } from "@/server/services/counts";
 
 type Params = { params: { slug: string } };
 
 export const dynamic = "force-dynamic";
 
 export async function generateMetadata({ params }: Params) {
-  const subject = await prisma.subject.findFirst({
-    where: { slug: params.slug, ...STUDENT_SUBJECT_FILTER },
-    select: { title: true },
-  });
+  await connectToDatabase();
+  const subject = await SubjectModel.findOne({ slug: params.slug, ...STUDENT_SUBJECT_FILTER })
+    .select("title")
+    .lean();
   return { title: subject?.title ?? "Subject" };
 }
 
@@ -46,41 +49,51 @@ const RULES = [
 export default async function SubjectDetailPage({ params }: Params) {
   const user = await requireUser();
 
-  const subject = await prisma.subject.findFirst({
-    where: { slug: params.slug, ...STUDENT_SUBJECT_FILTER },
-    select: {
-      id: true,
-      slug: true,
-      title: true,
-      description: true,
-      durationMin: true,
-      passMark: true,
-      topics: {
-        orderBy: { name: "asc" },
-        select: { id: true, name: true, _count: { select: { questions: true } } },
-      },
-      _count: { select: { questions: { where: { isActive: true } } } },
-    },
-  });
+  await connectToDatabase();
+
+  const raw = await SubjectModel.findOne({ slug: params.slug, ...STUDENT_SUBJECT_FILTER })
+    .select("slug title description durationMin passMark")
+    .populate({ path: "topics", select: "name", options: { sort: { name: 1 } } })
+    .lean();
 
   // A draft, deactivated, or non-existent subject is all the same 404 to a student.
-  if (!subject) notFound();
+  if (!raw) notFound();
 
-  // Scoped to this user: nobody can read another student's attempts from this page.
-  const attempts = await prisma.examAttempt.findMany({
-    where: { userId: user.id, subjectId: subject.id },
-    orderBy: { startedAt: "desc" },
-    select: {
-      id: true,
-      status: true,
-      attemptNumber: true,
-      percentage: true,
-      score: true,
-      totalPoints: true,
-      startedAt: true,
-      submittedAt: true,
-    },
-  });
+  const subject = normalizeIds(raw) as unknown as {
+    id: string;
+    slug: string;
+    title: string;
+    description: string | null;
+    durationMin: number;
+    passMark: number;
+    topics: Array<{ id: string; name: string }>;
+  };
+
+  const [questionCount, topicQuestionCounts, attemptsRaw] = await Promise.all([
+    QuestionModel.countDocuments({ subjectId: subject.id, isActive: true }),
+    // Was the nested `_count` inside `topics`.
+    countByParent(
+      QuestionModel,
+      "topicId",
+      (subject.topics ?? []).map((topic) => topic.id)
+    ),
+    // Scoped to this user: nobody can read another student's attempts from this page.
+    ExamAttemptModel.find({ userId: user.id, subjectId: subject.id })
+      .sort({ startedAt: -1 })
+      .select("status attemptNumber percentage score totalPoints startedAt submittedAt")
+      .lean(),
+  ]);
+
+  const attempts = normalizeIds(attemptsRaw) as unknown as Array<{
+    id: string;
+    status: string;
+    attemptNumber: number;
+    percentage: number | null;
+    score: number | null;
+    totalPoints: number | null;
+    startedAt: Date;
+    submittedAt: Date | null;
+  }>;
 
   const live = attempts.find((attempt) => attempt.status === "IN_PROGRESS");
   const submitted = attempts.filter((attempt) => attempt.status === "SUBMITTED");
@@ -91,7 +104,6 @@ export default async function SubjectDetailPage({ params }: Params) {
       ? percentages.reduce((sum, value) => sum + value, 0) / percentages.length
       : null;
 
-  const questionCount = subject._count.questions;
   const hasQuestions = questionCount > 0;
 
   return (
@@ -266,7 +278,9 @@ export default async function SubjectDetailPage({ params }: Params) {
                   {subject.topics.map((topic) => (
                     <Badge key={topic.id} variant="outline">
                       {topic.name}
-                      <span className="tabular-nums opacity-60">{topic._count.questions}</span>
+                      <span className="tabular-nums opacity-60">
+                        {topicQuestionCounts.get(topic.id) ?? 0}
+                      </span>
                     </Badge>
                   ))}
                 </CardContent>

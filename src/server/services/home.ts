@@ -1,6 +1,14 @@
-import type { HomeBlock, HomeBlockKind, HomeMetric, HomePage, Prisma } from "@prisma/client";
-
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase, mongoose } from "@/lib/mongoose";
+import { normalizeIds, serialize } from "@/lib/serialize";
+import {
+  ExamAttemptModel,
+  HomeBlockModel,
+  HomePageModel,
+  QuestionModel,
+  SubjectModel,
+  UserModel,
+} from "@/models";
+import type { HomeBlock, HomeBlockKind, HomeMetric, HomePage } from "@/types/models";
 
 /** The landing page's copy lives in a single row under this fixed id. */
 export const HOME_ID = "home";
@@ -54,7 +62,7 @@ export const HOME_DEFAULTS: HomeSettings = {
   metaDescription: null,
 };
 
-/** Seed content for the repeated sections, used by `prisma/seed.ts`. */
+/** Seed content for the repeated sections, used by `scripts/seed.ts`. */
 export const HOME_DEFAULT_BLOCKS: Record<
   HomeBlockKind,
   Array<Pick<HomeBlock, "title"> & Partial<Omit<HomeBlock, "id" | "kind" | "createdAt" | "updatedAt">>>
@@ -184,7 +192,18 @@ const integer = new Intl.NumberFormat("en-US");
  * landing page advertises. `STUDENTS` needs no filter because it already counts `role:
  * STUDENT` only.
  */
-const NON_GUEST = { user: { role: { not: "GUEST" } } } as const;
+/**
+ * Excludes guest-sat attempts from the public figures.
+ *
+ * Prisma expressed this as a join (`user: { role: { not: "GUEST" } }`). Mongo has none, so
+ * the guest ids are fetched and negated with `$nin`. Guests are the bounded side of the
+ * comparison — capped per code and swept after 30 days — so this stays far smaller than
+ * listing every student would.
+ */
+async function nonGuestFilter(): Promise<Record<string, unknown>> {
+  const guestIds = await UserModel.distinct("_id", { role: "GUEST" });
+  return guestIds.length > 0 ? { userId: { $nin: guestIds.map(String) } } : {};
+}
 
 /**
  * Counts the figures a stat block can display.
@@ -197,25 +216,25 @@ async function computeMetrics(
 ): Promise<Partial<Record<HomeMetric, number | null>>> {
   const wanted = (metric: HomeMetric) => needed.has(metric);
 
+  await connectToDatabase();
+
+  // Resolved once and shared: ATTEMPTS and AVERAGE_SCORE both need it and it costs a query.
+  const nonGuest = wanted("ATTEMPTS") || wanted("AVERAGE_SCORE") ? await nonGuestFilter() : {};
+
   const [students, subjects, questions, attempts, average, passRate] = await Promise.all([
-    wanted("STUDENTS")
-      ? prisma.user.count({ where: { role: "STUDENT", isActive: true } })
-      : null,
+    wanted("STUDENTS") ? UserModel.countDocuments({ role: "STUDENT", isActive: true }) : null,
     wanted("SUBJECTS")
-      ? prisma.subject.count({ where: { isPublished: true, isActive: true } })
+      ? SubjectModel.countDocuments({ isPublished: true, isActive: true })
       : null,
-    wanted("QUESTIONS")
-      ? prisma.question.count({
-          where: { isActive: true, subject: { isPublished: true, isActive: true } },
-        })
-      : null,
+    wanted("QUESTIONS") ? countLiveQuestions() : null,
     wanted("ATTEMPTS")
-      ? prisma.examAttempt.count({ where: { status: "SUBMITTED", ...NON_GUEST } })
+      ? ExamAttemptModel.countDocuments({ status: "SUBMITTED", ...nonGuest })
       : null,
     wanted("AVERAGE_SCORE")
-      ? prisma.examAttempt
-          .aggregate({ where: { status: "SUBMITTED", ...NON_GUEST }, _avg: { percentage: true } })
-          .then((row) => row._avg.percentage)
+      ? ExamAttemptModel.aggregate([
+          { $match: { status: "SUBMITTED", ...nonGuest } },
+          { $group: { _id: null, avg: { $avg: "$percentage" } } },
+        ]).then((rows) => (rows[0]?.avg as number | undefined) ?? null)
       : null,
     wanted("PASS_RATE") ? computePassRate() : null,
   ]);
@@ -231,29 +250,47 @@ async function computeMetrics(
 }
 
 /**
+ * Active questions that sit under a subject a visitor could actually reach.
+ *
+ * Prisma nested the subject's own flags inside the question filter; without joins the
+ * published subject ids are resolved first and matched with `$in`.
+ */
+async function countLiveQuestions(): Promise<number> {
+  const liveSubjectIds = await SubjectModel.distinct("_id", {
+    isPublished: true,
+    isActive: true,
+  });
+
+  return QuestionModel.countDocuments({
+    isActive: true,
+    subjectId: { $in: liveSubjectIds.map(String) },
+  });
+}
+
+/**
  * Share of submitted attempts that met their own subject's pass mark.
  *
- * Each attempt is compared against its subject's threshold, which Prisma can't express as
- * one cross-field filter — so it's one bounded count per subject, the same approach
+ * Each attempt is compared against its subject's threshold, which is not expressible as one
+ * cross-field filter — so it's one bounded count per subject, the same approach
  * `getSubjectStats` takes. Null when nothing has been submitted yet.
  */
 async function computePassRate(): Promise<number | null> {
+  const nonGuest = await nonGuestFilter();
+
   const [subjects, submitted] = await Promise.all([
-    prisma.subject.findMany({ select: { id: true, passMark: true } }),
-    prisma.examAttempt.count({ where: { status: "SUBMITTED", ...NON_GUEST } }),
+    SubjectModel.find().select("passMark").lean(),
+    ExamAttemptModel.countDocuments({ status: "SUBMITTED", ...nonGuest }),
   ]);
 
   if (submitted === 0) return null;
 
   const passes = await Promise.all(
     subjects.map((subject) =>
-      prisma.examAttempt.count({
-        where: {
-          subjectId: subject.id,
-          status: "SUBMITTED",
-          percentage: { gte: subject.passMark },
-          ...NON_GUEST,
-        },
+      ExamAttemptModel.countDocuments({
+        subjectId: String(subject._id),
+        status: "SUBMITTED",
+        percentage: { $gte: subject.passMark },
+        ...nonGuest,
       })
     )
   );
@@ -300,13 +337,14 @@ function resolveStats(
  * creating one, so an anonymous page view never writes to the database.
  */
 export async function loadHomeContent(): Promise<HomeContent> {
-  const [row, blocks] = await Promise.all([
-    prisma.homePage.findUnique({ where: { id: HOME_ID } }),
-    prisma.homeBlock.findMany({
-      where: { isActive: true },
-      orderBy: [{ order: "asc" }, { createdAt: "asc" }],
-    }),
+  await connectToDatabase();
+
+  const [row, blocksRaw] = await Promise.all([
+    HomePageModel.findOne({ _id: HOME_ID }).lean(),
+    HomeBlockModel.find({ isActive: true }).sort({ order: 1, createdAt: 1 }).lean(),
   ]);
+
+  const blocks = normalizeIds(blocksRaw) as unknown as HomeBlock[];
 
   const grouped = groupByKind(blocks);
   const needed = new Set(grouped.STAT.map((stat) => stat.metric).filter((m) => m !== "MANUAL"));
@@ -321,20 +359,22 @@ export async function loadHomeContent(): Promise<HomeContent> {
 
 /** The editor's view: every block, including the ones toggled off. */
 export async function loadHomeAdmin(): Promise<HomeAdminContent> {
-  const [row, blocks, metricValues] = await Promise.all([
-    prisma.homePage.findUnique({
-      where: { id: HOME_ID },
-      include: { updatedBy: { select: { name: true } } },
-    }),
-    prisma.homeBlock.findMany({ orderBy: [{ order: "asc" }, { createdAt: "asc" }] }),
+  await connectToDatabase();
+
+  const [row, blocksRaw, metricValues] = await Promise.all([
+    HomePageModel.findOne({ _id: HOME_ID })
+      .populate({ path: "updatedBy", select: "name" })
+      .lean(),
+    HomeBlockModel.find().sort({ order: 1, createdAt: 1 }).lean(),
     computeMetrics(new Set<HomeMetric>(["STUDENTS", "SUBJECTS", "QUESTIONS", "ATTEMPTS", "PASS_RATE", "AVERAGE_SCORE"])),
   ]);
 
   return {
     settings: row ? toSettings(row) : HOME_DEFAULTS,
-    blocks: groupByKind(blocks),
+    blocks: groupByKind(normalizeIds(blocksRaw) as unknown as HomeBlock[]),
     updatedAt: row?.updatedAt ?? null,
-    updatedByName: row?.updatedBy?.name ?? null,
+    updatedByName:
+      (row as { updatedBy?: { name?: string } } | null)?.updatedBy?.name ?? null,
     metrics: {
       STUDENTS: formatMetric("STUDENTS", metricValues.STUDENTS),
       SUBJECTS: formatMetric("SUBJECTS", metricValues.SUBJECTS),
@@ -346,9 +386,16 @@ export async function loadHomeAdmin(): Promise<HomeAdminContent> {
   };
 }
 
-function toSettings(row: HomePage): HomeSettings {
-  const { id, updatedById, createdAt, updatedAt, ...settings } = row;
-  return settings;
+/**
+ * Strips the non-copy fields, leaving just the editable settings.
+ *
+ * `_id` and the populated `updatedBy` are dropped alongside the columns Prisma exposed —
+ * a lean read carries both, and either one reaching a client component would break
+ * serialisation or leak the editor's name into the public payload.
+ */
+function toSettings(row: Record<string, unknown>): HomeSettings {
+  const { _id, id, updatedById, updatedBy, createdAt, updatedAt, ...settings } = row;
+  return settings as unknown as HomeSettings;
 }
 
 // ---------------------------------------------------------------------------
@@ -365,28 +412,44 @@ export async function saveHomeSettings(
   data: Partial<HomeSettings>,
   updatedById: string
 ): Promise<HomeSettings> {
-  const row = await prisma.homePage.upsert({
-    where: { id: HOME_ID },
-    create: { id: HOME_ID, ...HOME_DEFAULTS, ...data, updatedById },
-    update: { ...data, updatedById },
-  });
+  await connectToDatabase();
 
-  return toSettings(row);
+  // `$setOnInsert` carries only the defaults the admin did NOT supply — a field appearing
+  // in both operators is a conflicting-path error, and `data` must win where they overlap.
+  const defaultsForInsert = Object.fromEntries(
+    Object.entries(HOME_DEFAULTS).filter(([key]) => !(key in data))
+  );
+
+  const row = await HomePageModel.findOneAndUpdate(
+    { _id: HOME_ID },
+    { $set: { ...data, updatedById }, $setOnInsert: defaultsForInsert },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  )
+    .lean()
+    .orFail();
+
+  return toSettings(row as unknown as Record<string, unknown>);
 }
 
+/** What `createHomeBlock` accepts: the content fields, with `order` assigned here. */
+export type HomeBlockCreateInput = Pick<HomeBlock, "kind" | "title"> &
+  Partial<Pick<HomeBlock, "body" | "icon" | "metric" | "value" | "href" | "isActive">>;
+
 /** Appends a block to the end of its own kind's list. */
-export async function createHomeBlock(
-  data: Omit<Prisma.HomeBlockUncheckedCreateInput, "order">
-): Promise<HomeBlock> {
-  const last = await prisma.homeBlock.findFirst({
-    where: { kind: data.kind },
-    orderBy: { order: "desc" },
-    select: { order: true },
+export async function createHomeBlock(data: HomeBlockCreateInput): Promise<HomeBlock> {
+  await connectToDatabase();
+
+  const last = await HomeBlockModel.findOne({ kind: data.kind })
+    .sort({ order: -1 })
+    .select("order")
+    .lean();
+
+  const created = await HomeBlockModel.create({
+    ...data,
+    order: (last?.order ?? -1) + 1,
   });
 
-  return prisma.homeBlock.create({
-    data: { ...data, order: (last?.order ?? -1) + 1 },
-  });
+  return serialize<HomeBlock>(created);
 }
 
 /**
@@ -397,22 +460,36 @@ export async function createHomeBlock(
  * that was added from somewhere else.
  */
 export async function reorderHomeBlocks(kind: HomeBlockKind, ids: string[]): Promise<void> {
-  const existing = await prisma.homeBlock.findMany({
-    where: { kind },
-    orderBy: [{ order: "asc" }, { createdAt: "asc" }],
-    select: { id: true },
-  });
+  await connectToDatabase();
 
-  const known = new Set(existing.map((block) => block.id));
+  const existing = await HomeBlockModel.find({ kind })
+    .sort({ order: 1, createdAt: 1 })
+    .select("_id")
+    .lean();
+
+  const known = new Set(existing.map((block) => String(block._id)));
   const listed = ids.filter((id) => known.has(id));
-  const rest = existing.map((block) => block.id).filter((id) => !listed.includes(id));
+  const rest = existing.map((block) => String(block._id)).filter((id) => !listed.includes(id));
   const ordered = [...listed, ...rest];
 
-  await prisma.$transaction(
-    ordered.map((id, index) =>
-      prisma.homeBlock.update({ where: { id }, data: { order: index } })
-    )
-  );
+  if (ordered.length === 0) return;
+
+  // Prisma's array `$transaction` was all-or-nothing, and a half-applied reorder would
+  // leave two blocks sharing a position. `bulkWrite` is one round trip; the session keeps
+  // the original atomicity.
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      await HomeBlockModel.bulkWrite(
+        ordered.map((id, index) => ({
+          updateOne: { filter: { _id: id }, update: { $set: { order: index } } },
+        })),
+        { session }
+      );
+    });
+  } finally {
+    await session.endSession();
+  }
 }
 
 export { KINDS as HOME_BLOCK_KINDS };

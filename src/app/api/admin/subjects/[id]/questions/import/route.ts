@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
+import { randomUUID } from "crypto";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase, mongoose } from "@/lib/mongoose";
 import { requireApiAdmin } from "@/lib/rbac";
 import { badRequest, notFound } from "@/lib/api";
+import { QuestionModel, QuestionOptionModel, SubjectModel, TopicModel } from "@/models";
 import { parseQuestionCsv } from "@/server/services/question-import";
 import { writeAudit } from "@/server/services/audit";
 
@@ -33,11 +35,12 @@ export async function POST(req: Request, { params }: Params) {
   const auth = await requireApiAdmin();
   if (auth.error) return auth.error;
 
-  const subject = await prisma.subject.findUnique({
-    where: { id: params.id },
-    select: { id: true, title: true },
-  });
+  await connectToDatabase();
+
+  const subject = await SubjectModel.findOne({ _id: params.id }).select("title").lean();
   if (!subject) return notFound("Subject");
+
+  const subjectId = String(subject._id);
 
   const { csv, error: readError } = await readCsv(req);
   if (!csv) return badRequest(readError ?? "Could not read the upload.");
@@ -62,10 +65,7 @@ export async function POST(req: Request, { params }: Params) {
   }
 
   // Rows whose text already exists in this subject are reported, not duplicated.
-  const existing = await prisma.question.findMany({
-    where: { subjectId: subject.id },
-    select: { text: true },
-  });
+  const existing = await QuestionModel.find({ subjectId }).select("text").lean();
   const existingText = new Set(existing.map((question) => question.text.trim().toLowerCase()));
 
   const skipped = questions.filter((question) => existingText.has(question.text.toLowerCase()));
@@ -79,73 +79,84 @@ export async function POST(req: Request, { params }: Params) {
     });
   }
 
-  const result = await prisma.$transaction(async (tx) => {
-    // Resolve topic names to ids, creating any that don't exist yet in this subject.
-    const wanted = [...new Set(toImport.map((q) => q.topicName).filter((n): n is string => !!n))];
-    const topicIds = new Map<string, string>();
-    let topicsCreated = 0;
+  // The whole import is one transaction, as it was under Prisma: a partially imported file
+  // would leave the admin no way to tell which rows landed.
+  const session = await mongoose.startSession();
+  let topicsCreated = 0;
 
-    if (wanted.length > 0) {
-      const found = await tx.topic.findMany({
-        where: { subjectId: subject.id },
-        select: { id: true, name: true },
-      });
-      for (const topic of found) topicIds.set(topic.name.toLowerCase(), topic.id);
+  try {
+    await session.withTransaction(async () => {
+      topicsCreated = 0;
 
-      for (const name of wanted) {
-        if (topicIds.has(name.toLowerCase())) continue;
-        const created = await tx.topic.create({
-          data: { subjectId: subject.id, name },
-          select: { id: true, name: true },
-        });
-        topicIds.set(created.name.toLowerCase(), created.id);
-        topicsCreated++;
+      // Resolve topic names to ids, creating any that don't exist yet in this subject.
+      const wanted = [...new Set(toImport.map((q) => q.topicName).filter((n): n is string => !!n))];
+      const topicIds = new Map<string, string>();
+
+      if (wanted.length > 0) {
+        const found = await TopicModel.find({ subjectId })
+          .select("name")
+          .session(session)
+          .lean();
+        for (const topic of found) topicIds.set(topic.name.toLowerCase(), String(topic._id));
+
+        for (const name of wanted) {
+          if (topicIds.has(name.toLowerCase())) continue;
+          const [created] = await TopicModel.create([{ subjectId, name }], { session });
+          topicIds.set(created.name.toLowerCase(), String(created._id));
+          topicsCreated++;
+        }
       }
-    }
 
-    for (const question of toImport) {
-      await tx.question.create({
-        data: {
-          subjectId: subject.id,
-          topicId: question.topicName
-            ? topicIds.get(question.topicName.toLowerCase()) ?? null
-            : null,
-          text: question.text,
-          type: question.type,
-          difficulty: question.difficulty,
-          explanation: question.explanation,
-          points: question.points,
-          isActive: true,
-          createdById: auth.user.id,
-          options: {
-            create: question.options.map((option, index) => ({
-              text: option.text,
-              isCorrect: option.isCorrect,
-              order: index,
-            })),
-          },
-        },
-      });
-    }
+      // Built as two bulk inserts rather than a create-per-row: a 1000-question file would
+      // otherwise be 2000 sequential round trips inside one transaction. The ids are minted
+      // here (the same `randomUUID` the schema default uses) so the options can point at
+      // their question without waiting for the insert to hand ids back.
+      const questionDocs = toImport.map((question) => ({
+        _id: randomUUID(),
+        subjectId,
+        topicId: question.topicName
+          ? topicIds.get(question.topicName.toLowerCase()) ?? null
+          : null,
+        text: question.text,
+        type: question.type,
+        difficulty: question.difficulty,
+        explanation: question.explanation,
+        points: question.points,
+        isActive: true,
+        createdById: auth.user!.id,
+      }));
 
-    return { topicsCreated };
-  });
+      const optionDocs = toImport.flatMap((question, index) =>
+        question.options.map((option, order) => ({
+          questionId: questionDocs[index]._id,
+          text: option.text,
+          isCorrect: option.isCorrect,
+          order,
+        }))
+      );
+
+      await QuestionModel.insertMany(questionDocs, { session });
+      await QuestionOptionModel.insertMany(optionDocs, { session });
+    });
+  } finally {
+    await session.endSession();
+  }
 
   await writeAudit({
     userId: auth.user.id,
     action: "question.import",
     entity: "Subject",
-    entityId: subject.id,
+    entityId: subjectId,
     metadata: {
       imported: toImport.length,
       skipped: skipped.length,
-      topicsCreated: result.topicsCreated,
+      topicsCreated,
     },
   });
 
   return NextResponse.json({
     imported: toImport.length,
     skipped: skipped.map((question) => ({ line: question.line, text: question.text })),
-    topicsCreated: result.topicsCreated,
+    topicsCreated,
   });
 }

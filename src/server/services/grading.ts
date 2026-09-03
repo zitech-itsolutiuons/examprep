@@ -1,6 +1,8 @@
-import type { Prisma } from "@prisma/client";
+import type { ClientSession } from "mongoose";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase, mongoose } from "@/lib/mongoose";
+import { normalizeIds } from "@/lib/serialize";
+import { ExamAttemptModel, UserAnswerModel, UserProgressModel } from "@/models";
 
 /**
  * Server-side grading.
@@ -10,7 +12,7 @@ import { prisma } from "@/lib/prisma";
  * to a student before their attempt is submitted — so the only place correctness is
  * ever decided is here, on the server, against the database.
  *
- * Grading is driven by the `UserAnswer` rows written when the attempt started, which
+ * Grading is driven by the `UserAnswer` documents written when the attempt started, which
  * means the question set is the one the student actually sat, even if an admin has
  * since deactivated or edited questions in the bank.
  */
@@ -48,21 +50,38 @@ function sameSet(a: Set<string>, b: Set<string>) {
  * The selection to grade, normalised across question types.
  *
  * `selectedOptionId` (single-choice / true-false) and `selectedOptionIds`
- * (multiple-choice) are both read, so a row written by either path grades correctly
+ * (multiple-choice) are both read, so a document written by either path grades correctly
  * even if a question's type was changed between attempts.
  */
 function selectedIds(answer: {
   selectedOptionId: string | null;
   selectedOptionIds: string[];
 }): Set<string> {
-  const ids = new Set(answer.selectedOptionIds.filter(Boolean));
+  const ids = new Set((answer.selectedOptionIds ?? []).filter(Boolean));
   if (answer.selectedOptionId) ids.add(answer.selectedOptionId);
   return ids;
 }
 
+/** The populated shape grading reads. `.lean()` cannot infer virtual populate. */
+type GradableAttempt = {
+  id: string;
+  userId: string;
+  subjectId: string;
+  status: string;
+  startedAt: Date;
+  subject: { durationMin: number; passMark: number } | null;
+  answers: Array<{
+    id: string;
+    selectedOptionId: string | null;
+    selectedOptionIds: string[];
+    /** Null only if the question was hard-deleted without its cascade running. */
+    question: { points: number; options: Array<{ id: string }> } | null;
+  }>;
+};
+
 /**
  * Grades an in-progress attempt, marks it SUBMITTED, and refreshes the student's
- * `UserProgress` row for the subject. Idempotent by guard, not by retry: a second
+ * `UserProgress` document for the subject. Idempotent by guard, not by retry: a second
  * call throws `AttemptNotGradableError` rather than overwriting a stored result.
  *
  * `autoSubmitted` records that the timer ran out instead of the student pressing submit.
@@ -71,33 +90,28 @@ export async function gradeAndSubmitAttempt(
   attemptId: string,
   { autoSubmitted = false }: { autoSubmitted?: boolean } = {}
 ): Promise<GradeResult> {
-  const attempt = await prisma.examAttempt.findUnique({
-    where: { id: attemptId },
-    select: {
-      id: true,
-      userId: true,
-      subjectId: true,
-      status: true,
-      startedAt: true,
-      subject: { select: { durationMin: true, passMark: true } },
-      answers: {
-        select: {
-          id: true,
-          selectedOptionId: true,
-          selectedOptionIds: true,
-          question: {
-            select: {
-              points: true,
-              options: { where: { isCorrect: true }, select: { id: true } },
-            },
-          },
-        },
-      },
-    },
-  });
+  await connectToDatabase();
 
-  if (!attempt) throw new AttemptNotGradableError("MISSING");
+  const raw = await ExamAttemptModel.findOne({ _id: attemptId })
+    .populate({ path: "subject", select: "durationMin passMark" })
+    .populate({
+      path: "answers",
+      select: "selectedOptionId selectedOptionIds questionId",
+      populate: {
+        path: "question",
+        select: "points",
+        // Prisma's `options: { where: { isCorrect: true } }`. `match` filters the populated
+        // set, so `options` here is the ANSWER KEY and nothing else.
+        populate: { path: "options", match: { isCorrect: true }, select: "_id" },
+      },
+    })
+    .lean();
+
+  if (!raw) throw new AttemptNotGradableError("MISSING");
+
+  const attempt = normalizeIds(raw) as unknown as GradableAttempt;
   if (attempt.status !== "IN_PROGRESS") throw new AttemptNotGradableError(attempt.status);
+  if (!attempt.subject) throw new AttemptNotGradableError("MISSING");
 
   const correctIds: string[] = [];
   const incorrectIds: string[] = [];
@@ -107,6 +121,11 @@ export async function gradeAndSubmitAttempt(
   let totalPoints = 0;
 
   for (const answer of attempt.answers) {
+    // Under SQL this could not happen: deleting a question cascaded the answer away with
+    // it. Mongo has no such guarantee, so a snapshot row pointing at a deleted question is
+    // skipped rather than counted — it can neither be answered nor scored.
+    if (!answer.question) continue;
+
     const points = answer.question.points;
     totalPoints += points;
 
@@ -147,70 +166,90 @@ export async function gradeAndSubmitAttempt(
     passed: percentage >= passMark,
   };
 
-  await prisma.$transaction(async (tx) => {
-    // The status guard is re-applied as part of the write, so two concurrent submits
-    // can't both succeed — the loser updates 0 rows and is rejected below.
-    const claimed = await tx.examAttempt.updateMany({
-      where: { id: attempt.id, status: "IN_PROGRESS" },
-      data: {
-        status: "SUBMITTED",
-        score: result.score,
-        totalPoints: result.totalPoints,
-        percentage: result.percentage,
-        correctCount: result.correctCount,
-        incorrectCount: result.incorrectCount,
-        unansweredCount: result.unansweredCount,
-        timeSpentSec: result.timeSpentSec,
-        isAutoSubmitted: autoSubmitted,
-        submittedAt: new Date(),
-      },
+  const session = await mongoose.startSession();
+
+  try {
+    await session.withTransaction(async () => {
+      // The status guard is re-applied as part of the write, so two concurrent submits
+      // can't both succeed — the loser matches 0 documents and is rejected below.
+      const claimed = await ExamAttemptModel.updateOne(
+        { _id: attempt.id, status: "IN_PROGRESS" },
+        {
+          $set: {
+            status: "SUBMITTED",
+            score: result.score,
+            totalPoints: result.totalPoints,
+            percentage: result.percentage,
+            correctCount: result.correctCount,
+            incorrectCount: result.incorrectCount,
+            unansweredCount: result.unansweredCount,
+            timeSpentSec: result.timeSpentSec,
+            isAutoSubmitted: autoSubmitted,
+            submittedAt: new Date(),
+          },
+        },
+        { session }
+      );
+
+      // matchedCount, not modifiedCount: the filter carries the IN_PROGRESS guard, so a
+      // zero match is exactly "someone else already submitted this".
+      if (claimed.matchedCount === 0) throw new AttemptNotGradableError("SUBMITTED");
+
+      if (correctIds.length > 0) {
+        await UserAnswerModel.updateMany(
+          { _id: { $in: correctIds } },
+          { $set: { isCorrect: true } },
+          { session }
+        );
+      }
+      if (incorrectIds.length > 0) {
+        await UserAnswerModel.updateMany(
+          { _id: { $in: incorrectIds } },
+          { $set: { isCorrect: false } },
+          { session }
+        );
+      }
+      if (unansweredIds.length > 0) {
+        await UserAnswerModel.updateMany(
+          { _id: { $in: unansweredIds } },
+          { $set: { isCorrect: null } },
+          { session }
+        );
+      }
+
+      await recalculateProgress(session, attempt.userId, attempt.subjectId);
     });
-
-    if (claimed.count === 0) throw new AttemptNotGradableError("SUBMITTED");
-
-    if (correctIds.length > 0) {
-      await tx.userAnswer.updateMany({
-        where: { id: { in: correctIds } },
-        data: { isCorrect: true },
-      });
-    }
-    if (incorrectIds.length > 0) {
-      await tx.userAnswer.updateMany({
-        where: { id: { in: incorrectIds } },
-        data: { isCorrect: false },
-      });
-    }
-    if (unansweredIds.length > 0) {
-      await tx.userAnswer.updateMany({
-        where: { id: { in: unansweredIds } },
-        data: { isCorrect: null },
-      });
-    }
-
-    await recalculateProgress(tx, attempt.userId, attempt.subjectId);
-  });
+  } finally {
+    await session.endSession();
+  }
 
   return result;
 }
 
 /**
- * Rebuilds the denormalised `UserProgress` row from every SUBMITTED attempt for this
+ * Rebuilds the denormalised `UserProgress` document from every SUBMITTED attempt for this
  * user+subject. Recomputing from scratch (rather than folding the new attempt into the
- * old aggregate) keeps the row correct even if an attempt is ever removed.
+ * old aggregate) keeps the document correct even if an attempt is ever removed.
+ *
+ * Takes the Mongoose `ClientSession` where it used to take a Prisma transaction client, so
+ * the recalculation still commits or rolls back with the submit that triggered it.
  */
 export async function recalculateProgress(
-  tx: Prisma.TransactionClient,
+  session: ClientSession | null,
   userId: string,
   subjectId: string
 ) {
-  const attempts = await tx.examAttempt.findMany({
-    where: { userId, subjectId, status: "SUBMITTED" },
-    orderBy: { submittedAt: "asc" },
-    select: { score: true, percentage: true, submittedAt: true },
-  });
+  // Mongoose's option types accept `undefined` but not `null` for a session.
+  const ses = session ?? undefined;
+
+  const attempts = await ExamAttemptModel.find({ userId, subjectId, status: "SUBMITTED" })
+    .sort({ submittedAt: 1 })
+    .select("score percentage submittedAt")
+    .session(session)
+    .lean();
 
   if (attempts.length === 0) {
-    await tx.userProgress.deleteMany({ where: { userId, subjectId } });
+    await UserProgressModel.deleteMany({ userId, subjectId }, { session: ses });
     return;
   }
 
@@ -229,9 +268,11 @@ export async function recalculateProgress(
     lastAttemptAt: last.submittedAt,
   };
 
-  await tx.userProgress.upsert({
-    where: { userId_subjectId: { userId, subjectId } },
-    create: { userId, subjectId, ...data },
-    update: data,
-  });
+  // Prisma's upsert on @@unique([userId, subjectId]); the same pair is now a unique
+  // compound index, so `upsert` targets exactly one document.
+  await UserProgressModel.updateOne(
+    { userId, subjectId },
+    { $set: data, $setOnInsert: { userId, subjectId } },
+    { upsert: true, session: ses }
+  );
 }

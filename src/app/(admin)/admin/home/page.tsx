@@ -20,7 +20,7 @@ export default async function AdminHomePage() {
   const { settings, blocks, updatedAt, updatedByName, metrics } = await loadHomeAdmin();
 
   // Mapped to plain rows rather than passed straight through: client components in this
-  // codebase declare their own shapes instead of importing Prisma model types.
+  // codebase declare their own shapes instead of importing the domain model types.
   const toRow = (block: (typeof blocks)[HomeBlockKindName][number]): HomeBlockRow => ({
     id: block.id,
     title: block.title,

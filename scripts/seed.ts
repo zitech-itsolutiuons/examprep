@@ -10,7 +10,23 @@
  * what the running application would compute.
  */
 
-import { prisma } from "@/lib/prisma";
+// Must come first: it populates `process.env` for everything below. See scripts/env.ts.
+import "./env";
+
+import { connectToDatabase, mongoose } from "@/lib/mongoose";
+import {
+  ExamAttemptModel,
+  FlaggedQuestionModel,
+  HomeBlockModel,
+  HomePageModel,
+  QuestionModel,
+  QuestionOptionModel,
+  SubjectModel,
+  TopicModel,
+  UserAnswerModel,
+  UserModel,
+} from "@/models";
+import { normalizeIds } from "@/lib/serialize";
 import { hashPassword } from "@/lib/password";
 import { startOrResumeAttempt } from "@/server/services/attempts";
 import { gradeAndSubmitAttempt, recalculateProgress } from "@/server/services/grading";
@@ -642,13 +658,13 @@ function planFor(index: number, accuracy: number, blankRate: number) {
 // ---------------------------------------------------------------------------
 
 /**
- * The seed writes questions straight through Prisma, so it bypasses the zod schema in
+ * The seed writes questions straight through the models, so it bypasses the zod schema in
  * `src/server/validators/question.ts` that guards the admin UI. This re-applies those
  * same rules to the seed content, so an edit here can't create a question the admin
  * editor would refuse to save.
  *
  * It runs before any database call, which also makes it the fastest way to check the
- * content is sound without a live Postgres.
+ * content is sound without a reachable database.
  */
 function validateContent() {
   const problems: string[] = [];
@@ -747,108 +763,116 @@ function validateContent() {
 async function seedUsers() {
   const adminHash = await hashPassword(ADMIN.password);
 
-  const admin = await prisma.user.upsert({
-    where: { email: ADMIN.email },
-    create: {
-      name: ADMIN.name,
-      email: ADMIN.email,
-      passwordHash: adminHash,
-      role: "ADMIN",
-      emailVerified: new Date(),
+  // `upsert` became `findOneAndUpdate` with `upsert: true`. `$setOnInsert` carries the
+  // create-only fields so a re-run never resets `emailVerified` or the name on an account
+  // someone has since edited, matching Prisma's create/update split.
+  const admin = await UserModel.findOneAndUpdate(
+    { email: ADMIN.email },
+    {
+      // Re-running resets the demo password but never demotes a real admin account.
+      $set: { passwordHash: adminHash, role: "ADMIN", isActive: true },
+      $setOnInsert: { name: ADMIN.name, email: ADMIN.email, emailVerified: new Date() },
     },
-    // Re-running resets the demo password but never demotes a real admin account.
-    update: { passwordHash: adminHash, role: "ADMIN", isActive: true },
-  });
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  )
+    .lean()
+    .orFail();
 
   const students = [];
   for (const student of STUDENTS) {
     const passwordHash = await hashPassword(student.password);
-    students.push(
-      await prisma.user.upsert({
-        where: { email: student.email },
-        create: {
+    const row = await UserModel.findOneAndUpdate(
+      { email: student.email },
+      {
+        $set: { passwordHash, isActive: true },
+        $setOnInsert: {
           name: student.name,
           email: student.email,
-          passwordHash,
           role: "STUDENT",
           emailVerified: new Date(),
         },
-        update: { passwordHash, isActive: true },
-      })
-    );
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    )
+      .lean()
+      .orFail();
+
+    students.push(normalizeIds(row) as unknown as { id: string; email: string });
   }
 
   console.log(`  users:      1 admin, ${students.length} students`);
-  return { admin, students };
+  return { admin: normalizeIds(admin) as unknown as { id: string }, students };
 }
 
 async function seedContent(adminId: string) {
   let questionCount = 0;
 
   for (const seed of SUBJECTS) {
-    const subject = await prisma.subject.upsert({
-      where: { slug: seed.slug },
-      create: {
-        title: seed.title,
-        slug: seed.slug,
-        description: seed.description,
-        durationMin: seed.durationMin,
-        passMark: seed.passMark,
-        isPublished: seed.isPublished,
-        isActive: seed.isActive,
-        createdById: adminId,
+    const subjectRow = await SubjectModel.findOneAndUpdate(
+      { slug: seed.slug },
+      {
+        // Publish/active flags are refreshed so a re-run restores the intended demo state.
+        $set: {
+          title: seed.title,
+          description: seed.description,
+          durationMin: seed.durationMin,
+          passMark: seed.passMark,
+          isPublished: seed.isPublished,
+          isActive: seed.isActive,
+        },
+        $setOnInsert: { slug: seed.slug, createdById: adminId },
       },
-      // Publish/active flags are refreshed so a re-run restores the intended demo state.
-      update: {
-        title: seed.title,
-        description: seed.description,
-        durationMin: seed.durationMin,
-        passMark: seed.passMark,
-        isPublished: seed.isPublished,
-        isActive: seed.isActive,
-      },
-    });
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    )
+      .lean()
+      .orFail();
+
+    const subjectId = String(subjectRow._id);
 
     const topicIds = new Map<string, string>();
     for (const name of seed.topics) {
-      const topic = await prisma.topic.upsert({
-        where: { subjectId_name: { subjectId: subject.id, name } },
-        create: { name, subjectId: subject.id },
-        update: {},
-      });
-      topicIds.set(name, topic.id);
+      // Was the @@unique([subjectId, name]) compound key; the same pair is a unique index.
+      const topic = await TopicModel.findOneAndUpdate(
+        { subjectId, name },
+        { $setOnInsert: { subjectId, name } },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      )
+        .lean()
+        .orFail();
+      topicIds.set(name, String(topic._id));
     }
 
     for (const question of seed.questions) {
       // Questions have no natural key, so identity is (subject, exact text). That makes
       // the seed re-runnable without inserting duplicates on every run.
-      const existing = await prisma.question.findFirst({
-        where: { subjectId: subject.id, text: question.text },
-        select: { id: true },
-      });
+      const existing = await QuestionModel.findOne({ subjectId, text: question.text })
+        .select("_id")
+        .lean();
 
       if (existing) continue;
 
-      await prisma.question.create({
-        data: {
-          subjectId: subject.id,
-          topicId: question.topic ? topicIds.get(question.topic) ?? null : null,
-          text: question.text,
-          type: question.type,
-          difficulty: question.difficulty,
-          explanation: question.explanation,
-          points: question.points ?? 1,
-          isActive: true,
-          createdById: adminId,
-          options: {
-            create: question.options.map((option, index) => ({
-              text: option.text,
-              isCorrect: option.isCorrect,
-              order: index,
-            })),
-          },
-        },
+      const created = await QuestionModel.create({
+        subjectId,
+        topicId: question.topic ? topicIds.get(question.topic) ?? null : null,
+        text: question.text,
+        type: question.type,
+        difficulty: question.difficulty,
+        explanation: question.explanation,
+        points: question.points ?? 1,
+        isActive: true,
+        createdById: adminId,
       });
+
+      // Prisma's nested `options: { create: [...] }` — a separate collection now.
+      await QuestionOptionModel.insertMany(
+        question.options.map((option, index) => ({
+          questionId: String(created._id),
+          text: option.text,
+          isCorrect: option.isCorrect,
+          order: index,
+        }))
+      );
+
       questionCount += 1;
     }
   }
@@ -867,11 +891,10 @@ async function seedAttempts(studentIds: Map<string, string>) {
     const userId = studentIds.get(plan.email);
     if (!userId) continue;
 
-    const subject = await prisma.subject.findUnique({
-      where: { slug: plan.slug },
-      select: { id: true },
-    });
+    const subject = await SubjectModel.findOne({ slug: plan.slug }).select("_id").lean();
     if (!subject) continue;
+
+    const subjectId = String(subject._id);
 
     // Each plan is the Nth attempt for that student+subject. If they already have that
     // many, this plan has run before — so re-seeding adds nothing.
@@ -882,35 +905,38 @@ async function seedAttempts(studentIds: Map<string, string>) {
         index <= ATTEMPT_PLANS.indexOf(plan)
     ).length;
 
-    const existing = await prisma.examAttempt.count({
-      where: { userId, subjectId: subject.id },
-    });
+    const existing = await ExamAttemptModel.countDocuments({ userId, subjectId });
     if (existing >= alreadyRun) {
       skipped += 1;
       continue;
     }
 
-    const started = await startOrResumeAttempt(userId, subject.id);
+    const started = await startOrResumeAttempt(userId, subjectId);
     if (!started.ok) continue;
 
-    const answers = await prisma.userAnswer.findMany({
-      where: { attemptId: started.attemptId },
-      orderBy: { order: "asc" },
-      select: {
-        id: true,
-        questionId: true,
-        question: {
-          select: {
-            type: true,
-            options: { orderBy: { order: "asc" }, select: { id: true, isCorrect: true } },
-          },
-        },
-      },
-    });
+    const answersRaw = await UserAnswerModel.find({ attemptId: started.attemptId })
+      .sort({ order: 1 })
+      .select("questionId")
+      .populate({
+        path: "question",
+        select: "type",
+        populate: { path: "options", select: "isCorrect order", options: { sort: { order: 1 } } },
+      })
+      .lean();
+
+    const answers = normalizeIds(answersRaw) as unknown as Array<{
+      id: string;
+      questionId: string;
+      question: {
+        type: string;
+        options: Array<{ id: string; isCorrect: boolean }>;
+      } | null;
+    }>;
 
     for (const [index, answer] of answers.entries()) {
       const intent = planFor(index, plan.accuracy, plan.blankRate ?? 0);
       if (intent === "blank") continue;
+      if (!answer.question) continue;
 
       const correct = answer.question.options.filter((o) => o.isCorrect).map((o) => o.id);
       const wrong = answer.question.options.filter((o) => !o.isCorrect).map((o) => o.id);
@@ -928,33 +954,32 @@ async function seedAttempts(studentIds: Map<string, string>) {
 
       if (selected.length === 0) continue;
 
-      await prisma.userAnswer.update({
-        where: { id: answer.id },
-        data: {
-          selectedOptionId:
-            answer.question.type === "MULTIPLE_CHOICE" ? null : selected[0] ?? null,
-          selectedOptionIds: selected,
-          answeredAt: new Date(),
-        },
-      });
+      await UserAnswerModel.updateOne(
+        { _id: answer.id },
+        {
+          $set: {
+            selectedOptionId:
+              answer.question.type === "MULTIPLE_CHOICE" ? null : selected[0] ?? null,
+            selectedOptionIds: selected,
+            answeredAt: new Date(),
+          },
+        }
+      );
     }
 
     // Flag a couple of questions so the review page's flag filter has data.
     for (const answer of answers.slice(1, 3)) {
-      await prisma.flaggedQuestion.upsert({
-        where: {
-          attemptId_questionId: {
+      await FlaggedQuestionModel.updateOne(
+        { attemptId: started.attemptId, questionId: answer.questionId },
+        {
+          $setOnInsert: {
             attemptId: started.attemptId,
             questionId: answer.questionId,
+            userId,
           },
         },
-        create: {
-          attemptId: started.attemptId,
-          questionId: answer.questionId,
-          userId,
-        },
-        update: {},
-      });
+        { upsert: true }
+      );
     }
 
     if (plan.leaveOpen) {
@@ -970,23 +995,28 @@ async function seedAttempts(studentIds: Map<string, string>) {
     // from the corrected dates below.
     const submittedAt = new Date(Date.now() - plan.daysAgo * 86_400_000);
     const timeSpentSec = plan.timeSpentSec ?? 900;
-    await prisma.examAttempt.update({
-      where: { id: started.attemptId },
-      data: {
-        submittedAt,
-        startedAt: new Date(submittedAt.getTime() - timeSpentSec * 1000),
-        timeSpentSec,
-      },
-    });
+    await ExamAttemptModel.updateOne(
+      { _id: started.attemptId },
+      {
+        $set: {
+          submittedAt,
+          startedAt: new Date(submittedAt.getTime() - timeSpentSec * 1000),
+          timeSpentSec,
+        },
+      }
+    );
 
-    touched.add(`${userId}:${subject.id}`);
+    touched.add(`${userId}:${subjectId}`);
     created += 1;
   }
 
   // `lastAttemptAt` was written against the pre-backdate timestamps, so recompute.
+  // `recalculateProgress` takes a Mongoose session where it used to take a Prisma
+  // transaction client; passing null runs it outside a transaction, which is all the seed
+  // needs since nothing else is writing concurrently.
   for (const key of touched) {
     const [userId, subjectId] = key.split(":");
-    await prisma.$transaction((tx) => recalculateProgress(tx, userId, subjectId));
+    await recalculateProgress(null, userId, subjectId);
   }
 
   console.log(
@@ -1002,22 +1032,22 @@ async function seedAttempts(studentIds: Map<string, string>) {
  * duplicating, or overwriting, blocks an admin has since edited in the UI.
  */
 async function seedHomePage() {
-  await prisma.homePage.upsert({
-    where: { id: HOME_ID },
-    create: { id: HOME_ID, ...HOME_DEFAULTS },
-    update: {},
-  });
+  await HomePageModel.updateOne(
+    { _id: HOME_ID },
+    { $setOnInsert: { _id: HOME_ID, ...HOME_DEFAULTS } },
+    { upsert: true, setDefaultsOnInsert: true }
+  );
 
   let created = 0;
 
   for (const kind of HOME_BLOCK_KINDS) {
-    const existing = await prisma.homeBlock.count({ where: { kind } });
+    const existing = await HomeBlockModel.countDocuments({ kind });
     if (existing > 0) continue;
 
     const defaults = HOME_DEFAULT_BLOCKS[kind];
-    await prisma.homeBlock.createMany({
-      data: defaults.map((block, index) => ({ ...block, kind, order: index })),
-    });
+    await HomeBlockModel.insertMany(
+      defaults.map((block, index) => ({ ...block, kind, order: index }))
+    );
     created += defaults.length;
   }
 
@@ -1042,11 +1072,21 @@ async function seedGuestAccess() {
   );
 }
 
-async function main() {
+/**
+ * Populates an empty (or partly seeded) database. Safe to run repeatedly.
+ *
+ * Exported so `scripts/reset.ts` can drop and reseed in one command without shelling out to
+ * a second `npm run`, which would lose the `--force` flag npm appends to the end of a script.
+ */
+export async function seed() {
   console.log("\nSeeding ExamPrep…\n");
 
   // Fails fast, before touching the database.
   validateContent();
+
+  // Every model call needs the connection up first; the seed is the one entry point that
+  // isn't a request, so nothing else has opened it.
+  await connectToDatabase();
 
   const { admin, students } = await seedUsers();
   await seedContent(admin.id);
@@ -1060,9 +1100,17 @@ async function main() {
   console.log("\nDone.\n");
 }
 
-main()
-  .catch((error) => {
-    console.error("\nSeed failed:\n", error);
-    process.exit(1);
-  })
-  .finally(() => prisma.$disconnect());
+/**
+ * Runs the seed only when this file is the process entry point — i.e. `npm run db:seed`.
+ *
+ * Without the guard, `scripts/reset.ts` importing `seed` would trigger a seed as an import
+ * side effect, before the reset had finished dropping anything.
+ */
+if (process.argv[1] && /[\\/]seed\.ts$/.test(process.argv[1])) {
+  seed()
+    .catch((error) => {
+      console.error("\nSeed failed:\n", error);
+      process.exit(1);
+    })
+    .finally(() => mongoose.disconnect());
+}

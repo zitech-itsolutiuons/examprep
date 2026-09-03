@@ -1,10 +1,13 @@
 import { NextResponse } from "next/server";
-import { Prisma } from "@prisma/client";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import { normalizeIds, serialize } from "@/lib/serialize";
 import { requireApiAdmin } from "@/lib/rbac";
 import { conflict, notFound, readJson, validationError } from "@/lib/api";
+import { QuestionModel, SubjectModel, TopicModel } from "@/models";
 import { topicCreateSchema } from "@/server/validators/topic";
+import { attachCounts, countByParent } from "@/server/services/counts";
+import { isDuplicateKeyError } from "@/lib/mongoose";
 import { writeAudit } from "@/server/services/audit";
 
 export async function GET(req: Request) {
@@ -13,14 +16,29 @@ export async function GET(req: Request) {
 
   const subjectId = new URL(req.url).searchParams.get("subjectId");
 
-  const topics = await prisma.topic.findMany({
-    where: subjectId ? { subjectId } : undefined,
-    orderBy: [{ subject: { title: "asc" } }, { name: "asc" }],
-    include: {
-      subject: { select: { id: true, title: true } },
-      _count: { select: { questions: true } },
-    },
-  });
+  await connectToDatabase();
+
+  const raw = await TopicModel.find(subjectId ? { subjectId } : {})
+    .sort({ name: 1 })
+    .populate({ path: "subject", select: "title" })
+    .lean();
+
+  const rows = normalizeIds(raw) as unknown as Array<
+    Record<string, unknown> & { id: string; subject?: { title?: string } | null }
+  >;
+
+  // Prisma ordered by the joined `subject.title` then `name`. Mongo cannot sort on a
+  // populated field, so the subject-level ordering is applied here; `name` is already
+  // sorted by the query, and the comparison below is stable so it survives.
+  rows.sort((a, b) => (a.subject?.title ?? "").localeCompare(b.subject?.title ?? ""));
+
+  const questionCounts = await countByParent(
+    QuestionModel,
+    "topicId",
+    rows.map((topic) => topic.id)
+  );
+
+  const topics = attachCounts(rows, { questions: questionCounts });
 
   return NextResponse.json({ topics });
 }
@@ -34,16 +52,19 @@ export async function POST(req: Request) {
 
   const { subjectId, name, description } = parsed.data;
 
-  const subject = await prisma.subject.findUnique({
-    where: { id: subjectId },
-    select: { id: true },
-  });
+  await connectToDatabase();
+
+  const subject = await SubjectModel.findOne({ _id: subjectId }).select("_id").lean();
   if (!subject) return notFound("Subject");
 
   try {
-    const topic = await prisma.topic.create({
-      data: { subjectId, name, description: description || null },
+    const created = await TopicModel.create({
+      subjectId,
+      name,
+      description: description || null,
     });
+
+    const topic = serialize<{ id: string; name: string }>(created);
 
     await writeAudit({
       userId: auth.user.id,
@@ -55,8 +76,8 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ topic }, { status: 201 });
   } catch (err) {
-    // @@unique([subjectId, name])
-    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+    // The unique compound index on { subjectId, name }. Was Prisma's P2002.
+    if (isDuplicateKeyError(err)) {
       return conflict("A topic with that name already exists in this subject.");
     }
     throw err;

@@ -13,7 +13,7 @@ const GUEST_ALLOWED = ["/subjects", "/exam", "/results"];
  * `.next/server/middleware-manifest.json` after a build if you need to confirm it registered.
  *
  * This runs on the Edge runtime, so it deliberately does *not* import the guest service —
- * that pulls in Prisma, which can't run here. It makes only the checks the token can answer
+ * that pulls in Mongoose, which can't run here. It makes only the checks the token can answer
  * on its own: role, and a guest's own expiry. The generation check (an admin reset) needs
  * the code row, so it happens in `getCurrentUser()`, which every page and API route already
  * calls. A revoked guest therefore gets through middleware and is stopped one layer later —

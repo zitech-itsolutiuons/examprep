@@ -1,14 +1,16 @@
 import { z } from "zod";
 
+import { id as idSchema } from "@/server/validators/id";
+
 const optionSchema = z.object({
-  id: z.string().cuid().optional(), // present when editing an existing option
+  id: idSchema().optional(), // present when editing an existing option
   text: z.string().trim().min(1, "Option text is required").max(500),
   isCorrect: z.boolean(),
 });
 
 const baseQuestion = z.object({
-  subjectId: z.string().cuid("Select a subject"),
-  topicId: z.string().cuid().nullish(),
+  subjectId: idSchema("Select a subject"),
+  topicId: idSchema().nullish(),
   text: z.string().trim().min(5, "Question text must be at least 5 characters").max(4000),
   type: z.enum(["SINGLE_CHOICE", "MULTIPLE_CHOICE", "TRUE_FALSE"]),
   difficulty: z.enum(["EASY", "MEDIUM", "HARD"]),

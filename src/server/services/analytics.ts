@@ -1,4 +1,12 @@
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import {
+  ExamAttemptModel,
+  QuestionModel,
+  SubjectModel,
+  UserAnswerModel,
+  UserModel,
+} from "@/models";
+import { countByParent } from "@/server/services/counts";
 
 /**
  * Attempts that count toward the reported figures.
@@ -7,8 +15,16 @@ import { prisma } from "@/lib/prisma";
  * handed out to a class would otherwise move the platform-wide averages and pass rates that
  * an admin uses to judge real student performance. The attempts themselves stay fully
  * browsable under /admin/attempts, where the Guests filter separates them out.
+ *
+ * Prisma expressed this as a join (`user: { role: { not: "GUEST" } }`). MongoDB has none, so
+ * the guest ids are read once and negated with `$nin`. Guests are the bounded side of the
+ * comparison — capped per code and swept after 30 days — so this stays far smaller than
+ * listing every real account would. The same trade-off is made in `home.ts`.
  */
-const NON_GUEST = { user: { role: { not: "GUEST" } } } as const;
+async function nonGuestFilter(): Promise<Record<string, unknown>> {
+  const guestIds = await UserModel.distinct("_id", { role: "GUEST" });
+  return guestIds.length > 0 ? { userId: { $nin: guestIds.map(String) } } : {};
+}
 
 export type PlatformOverview = {
   users: number;
@@ -61,63 +77,66 @@ function round(value: number | null | undefined, dp = 1): number | null {
  * Per-subject attempt statistics.
  *
  * Pass rate compares each attempt's percentage against its own subject's pass mark, which
- * Prisma can't express as a single cross-field filter — so it's one bounded count per
- * subject rather than a scan of every attempt row.
+ * is not expressible as a single cross-field filter — so it's one bounded count per subject
+ * rather than a scan of every attempt row.
  */
 export async function getSubjectStats(): Promise<SubjectStat[]> {
-  const subjects = await prisma.subject.findMany({
-    orderBy: { title: "asc" },
-    select: {
-      id: true,
-      title: true,
-      isPublished: true,
-      isActive: true,
-      passMark: true,
-      _count: { select: { questions: true } },
-    },
-  });
+  await connectToDatabase();
+
+  const subjects = await SubjectModel.find()
+    .sort({ title: 1 })
+    .select("title isPublished isActive passMark")
+    .lean();
 
   if (subjects.length === 0) return [];
 
-  const [grouped, passCounts] = await Promise.all([
-    prisma.examAttempt.groupBy({
-      by: ["subjectId"],
-      where: { status: "SUBMITTED", ...NON_GUEST },
-      _count: { _all: true },
-      _avg: { percentage: true },
-      _max: { percentage: true },
-    }),
+  const nonGuest = await nonGuestFilter();
+  const subjectIds = subjects.map((subject) => String(subject._id));
+
+  const [questionCounts, grouped, passCounts] = await Promise.all([
+    countByParent(QuestionModel, "subjectId", subjectIds),
+    // Was `groupBy({ by: ["subjectId"], _count, _avg, _max })`.
+    ExamAttemptModel.aggregate<{ _id: string; count: number; avg: number | null; max: number | null }>([
+      { $match: { status: "SUBMITTED", subjectId: { $in: subjectIds }, ...nonGuest } },
+      {
+        $group: {
+          _id: "$subjectId",
+          count: { $sum: 1 },
+          avg: { $avg: "$percentage" },
+          max: { $max: "$percentage" },
+        },
+      },
+    ]),
     Promise.all(
       subjects.map((subject) =>
-        prisma.examAttempt.count({
-          where: {
-            subjectId: subject.id,
-            status: "SUBMITTED",
-            percentage: { gte: subject.passMark },
-            ...NON_GUEST,
-          },
+        ExamAttemptModel.countDocuments({
+          subjectId: String(subject._id),
+          status: "SUBMITTED",
+          percentage: { $gte: subject.passMark },
+          ...nonGuest,
         })
       )
     ),
   ]);
 
-  const byId = new Map(grouped.map((row) => [row.subjectId, row]));
+  const byId = new Map(grouped.map((row) => [String(row._id), row]));
 
   return subjects.map((subject, index) => {
-    const row = byId.get(subject.id);
-    const attemptCount = row?._count._all ?? 0;
+    const id = String(subject._id);
+    const row = byId.get(id);
+    const attemptCount = row?.count ?? 0;
     const passCount = passCounts[index];
 
     return {
-      id: subject.id,
+      id,
       title: subject.title,
       isPublished: subject.isPublished,
       isActive: subject.isActive,
       passMark: subject.passMark,
-      questionCount: subject._count.questions,
+      questionCount: questionCounts.get(id) ?? 0,
       attemptCount,
-      averagePercentage: round(row?._avg.percentage),
-      bestPercentage: round(row?._max.percentage),
+      averagePercentage: round(row?.avg),
+      bestPercentage: round(row?.max),
       passCount,
       passRate: attemptCount > 0 ? round((passCount / attemptCount) * 100) : null,
     };
@@ -125,6 +144,10 @@ export async function getSubjectStats(): Promise<SubjectStat[]> {
 }
 
 export async function getPlatformOverview(): Promise<PlatformOverview> {
+  await connectToDatabase();
+
+  const nonGuest = await nonGuestFilter();
+
   const [
     users,
     admins,
@@ -139,20 +162,20 @@ export async function getPlatformOverview(): Promise<PlatformOverview> {
     scoreAggregate,
     subjectStats,
   ] = await Promise.all([
-    prisma.user.count({ where: { role: { not: "GUEST" } } }),
-    prisma.user.count({ where: { role: "ADMIN" } }),
-    prisma.user.count({ where: { isActive: true, role: { not: "GUEST" } } }),
-    prisma.subject.count(),
-    prisma.subject.count({ where: { isPublished: true, isActive: true } }),
-    prisma.question.count(),
-    prisma.question.count({ where: { isActive: true } }),
-    prisma.examAttempt.count({ where: NON_GUEST }),
-    prisma.examAttempt.count({ where: { status: "SUBMITTED", ...NON_GUEST } }),
-    prisma.examAttempt.count({ where: { status: "IN_PROGRESS", ...NON_GUEST } }),
-    prisma.examAttempt.aggregate({
-      where: { status: "SUBMITTED", ...NON_GUEST },
-      _avg: { percentage: true },
-    }),
+    UserModel.countDocuments({ role: { $ne: "GUEST" } }),
+    UserModel.countDocuments({ role: "ADMIN" }),
+    UserModel.countDocuments({ isActive: true, role: { $ne: "GUEST" } }),
+    SubjectModel.countDocuments(),
+    SubjectModel.countDocuments({ isPublished: true, isActive: true }),
+    QuestionModel.countDocuments(),
+    QuestionModel.countDocuments({ isActive: true }),
+    ExamAttemptModel.countDocuments(nonGuest),
+    ExamAttemptModel.countDocuments({ status: "SUBMITTED", ...nonGuest }),
+    ExamAttemptModel.countDocuments({ status: "IN_PROGRESS", ...nonGuest }),
+    ExamAttemptModel.aggregate<{ avg: number | null }>([
+      { $match: { status: "SUBMITTED", ...nonGuest } },
+      { $group: { _id: null, avg: { $avg: "$percentage" } } },
+    ]).then((rows) => rows[0]?.avg ?? null),
     getSubjectStats(),
   ]);
 
@@ -170,7 +193,7 @@ export async function getPlatformOverview(): Promise<PlatformOverview> {
     attempts,
     submittedAttempts,
     inProgressAttempts,
-    averagePercentage: round(scoreAggregate._avg.percentage),
+    averagePercentage: round(scoreAggregate),
     passRate: submittedAttempts > 0 ? round((totalPasses / submittedAttempts) * 100) : null,
   };
 }
@@ -178,52 +201,73 @@ export async function getPlatformOverview(): Promise<PlatformOverview> {
 /**
  * Questions students get wrong most often — the signal an admin needs to spot a badly
  * worded question or a topic that needs better teaching material.
+ *
+ * Prisma filtered on the related attempt (`attempt: { status: "SUBMITTED" }`). Without joins
+ * the qualifying attempt ids are resolved first and matched with `$in`, and the totals and
+ * correct counts come back from one grouping rather than two.
  */
 export async function getHardestQuestions(limit = 10, minAnswers = 3): Promise<HardQuestion[]> {
-  const [totals, corrects] = await Promise.all([
-    prisma.userAnswer.groupBy({
-      by: ["questionId"],
-      where: { attempt: { status: "SUBMITTED", ...NON_GUEST } },
-      _count: { _all: true },
-    }),
-    prisma.userAnswer.groupBy({
-      by: ["questionId"],
-      where: { attempt: { status: "SUBMITTED", ...NON_GUEST }, isCorrect: true },
-      _count: { _all: true },
-    }),
+  await connectToDatabase();
+
+  const nonGuest = await nonGuestFilter();
+
+  const attemptIds = await ExamAttemptModel.distinct("_id", {
+    status: "SUBMITTED",
+    ...nonGuest,
+  });
+
+  if (attemptIds.length === 0) return [];
+
+  const totals = await UserAnswerModel.aggregate<{
+    _id: string;
+    answered: number;
+    correct: number;
+  }>([
+    { $match: { attemptId: { $in: attemptIds.map(String) } } },
+    {
+      $group: {
+        _id: "$questionId",
+        answered: { $sum: 1 },
+        // One pass for both figures; `isCorrect` is null for an unanswered question, so the
+        // comparison counts only genuinely correct answers.
+        correct: { $sum: { $cond: [{ $eq: ["$isCorrect", true] }, 1, 0] } },
+      },
+    },
+    { $match: { answered: { $gte: minAnswers } } },
+    { $sort: { answered: -1 } },
   ]);
 
   if (totals.length === 0) return [];
 
-  const correctById = new Map(corrects.map((row) => [row.questionId, row._count._all]));
-
   const ranked = totals
-    .map((row) => {
-      const answered = row._count._all;
-      const correct = correctById.get(row.questionId) ?? 0;
-      return { questionId: row.questionId, answered, correct, correctRate: correct / answered };
-    })
-    .filter((row) => row.answered >= minAnswers)
+    .map((row) => ({
+      questionId: String(row._id),
+      answered: row.answered,
+      correct: row.correct,
+      correctRate: row.correct / row.answered,
+    }))
     .sort((a, b) => a.correctRate - b.correctRate || b.answered - a.answered)
     .slice(0, limit);
 
-  if (ranked.length === 0) return [];
+  const questions = await QuestionModel.find({ _id: { $in: ranked.map((row) => row.questionId) } })
+    .select("text subjectId")
+    .populate({ path: "subject", select: "title" })
+    .lean();
 
-  const questions = await prisma.question.findMany({
-    where: { id: { in: ranked.map((row) => row.questionId) } },
-    select: { id: true, text: true, subject: { select: { id: true, title: true } } },
-  });
-  const questionById = new Map(questions.map((question) => [question.id, question]));
+  const questionById = new Map(questions.map((question) => [String(question._id), question]));
 
   return ranked.flatMap((row) => {
     const question = questionById.get(row.questionId);
     if (!question) return [];
+
+    const subject = (question as { subject?: { title?: string } | null }).subject;
+
     return [
       {
-        id: question.id,
+        id: row.questionId,
         text: question.text,
-        subjectId: question.subject.id,
-        subjectTitle: question.subject.title,
+        subjectId: question.subjectId,
+        subjectTitle: subject?.title ?? "—",
         answered: row.answered,
         correct: row.correct,
         correctRate: Number((row.correctRate * 100).toFixed(1)),
@@ -234,6 +278,10 @@ export async function getHardestQuestions(limit = 10, minAnswers = 3): Promise<H
 
 /** Ten-point score buckets across all submitted attempts. */
 export async function getScoreDistribution(): Promise<ScoreBucket[]> {
+  await connectToDatabase();
+
+  const nonGuest = await nonGuestFilter();
+
   const ranges = Array.from({ length: 10 }, (_, index) => ({
     from: index * 10,
     to: index === 9 ? 100 : index * 10 + 10,
@@ -241,15 +289,12 @@ export async function getScoreDistribution(): Promise<ScoreBucket[]> {
 
   const counts = await Promise.all(
     ranges.map((range, index) =>
-      prisma.examAttempt.count({
-        where: {
-          status: "SUBMITTED",
-          ...NON_GUEST,
-          percentage:
-            index === 9
-              ? { gte: range.from, lte: 100 }
-              : { gte: range.from, lt: range.to },
-        },
+      ExamAttemptModel.countDocuments({
+        status: "SUBMITTED",
+        ...nonGuest,
+        // The top bucket is inclusive of 100 so a perfect score is counted somewhere.
+        percentage:
+          index === 9 ? { $gte: range.from, $lte: 100 } : { $gte: range.from, $lt: range.to },
       })
     )
   );

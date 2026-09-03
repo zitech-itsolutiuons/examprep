@@ -1,6 +1,7 @@
 import { NextAuthOptions } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase } from "@/lib/mongoose";
+import { UserModel } from "@/models";
 import { verifyPassword } from "@/lib/password";
 import { redeemCode } from "@/server/services/guest-access";
 
@@ -23,9 +24,10 @@ export const authOptions: NextAuthOptions = {
       async authorize(credentials) {
         if (!credentials?.email || !credentials?.password) return null;
 
-        const user = await prisma.user.findUnique({
-          where: { email: credentials.email.toLowerCase() },
-        });
+        await connectToDatabase();
+        const user = await UserModel.findOne({
+          email: credentials.email.toLowerCase(),
+        }).lean();
 
         if (!user || !user.isActive) return null;
 

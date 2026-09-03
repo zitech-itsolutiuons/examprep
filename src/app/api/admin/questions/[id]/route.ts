@@ -1,15 +1,17 @@
 import { NextResponse } from "next/server";
 
-import { prisma } from "@/lib/prisma";
+import { connectToDatabase, mongoose } from "@/lib/mongoose";
 import { requireApiAdmin } from "@/lib/rbac";
 import { badRequest, conflict, notFound, readJson, validationError } from "@/lib/api";
+import { QuestionModel, UserAnswerModel } from "@/models";
 import { questionUpdateSchema } from "@/server/validators/question";
 import {
   OptionInUseError,
-  questionInclude,
+  loadAdminQuestion,
   syncQuestionOptions,
   topicBelongsToSubject,
 } from "@/server/services/questions";
+import { deleteQuestions } from "@/server/services/cascade";
 import { writeAudit } from "@/server/services/audit";
 
 type Params = { params: { id: string } };
@@ -18,10 +20,7 @@ export async function GET(_req: Request, { params }: Params) {
   const auth = await requireApiAdmin();
   if (auth.error) return auth.error;
 
-  const question = await prisma.question.findUnique({
-    where: { id: params.id },
-    include: questionInclude,
-  });
+  const question = await loadAdminQuestion(params.id);
 
   if (!question) return notFound("Question");
   return NextResponse.json({ question });
@@ -34,10 +33,9 @@ export async function PATCH(req: Request, { params }: Params) {
   const parsed = questionUpdateSchema.safeParse(await readJson(req));
   if (!parsed.success) return validationError(parsed.error);
 
-  const existing = await prisma.question.findUnique({
-    where: { id: params.id },
-    select: { id: true, subjectId: true },
-  });
+  await connectToDatabase();
+
+  const existing = await QuestionModel.findOne({ _id: params.id }).select("subjectId").lean();
   if (!existing) return notFound("Question");
 
   const { topicId, text, type, difficulty, explanation, points, isActive, options } = parsed.data;
@@ -46,66 +44,77 @@ export async function PATCH(req: Request, { params }: Params) {
     return badRequest("That topic does not belong to this question's subject.");
   }
 
+  // The update and its option reconciliation must land together, exactly as Prisma's
+  // `$transaction` did — a committed question with half-applied options would leave the
+  // wrong answer key on a live question.
+  const session = await mongoose.startSession();
+
   try {
-    const question = await prisma.$transaction(async (tx) => {
-      await tx.question.update({
-        where: { id: params.id },
-        data: {
-          // subjectId is intentionally immutable — moving a question between subjects
-          // would orphan it from the attempts that already scored it.
-          ...(topicId !== undefined ? { topicId: topicId ?? null } : {}),
-          ...(text !== undefined ? { text } : {}),
-          ...(type !== undefined ? { type } : {}),
-          ...(difficulty !== undefined ? { difficulty } : {}),
-          ...(explanation !== undefined ? { explanation: explanation || null } : {}),
-          ...(points !== undefined ? { points } : {}),
-          ...(isActive !== undefined ? { isActive } : {}),
+    await session.withTransaction(async () => {
+      await QuestionModel.updateOne(
+        { _id: params.id },
+        {
+          $set: {
+            // subjectId is intentionally immutable — moving a question between subjects
+            // would orphan it from the attempts that already scored it.
+            ...(topicId !== undefined ? { topicId: topicId ?? null } : {}),
+            ...(text !== undefined ? { text } : {}),
+            ...(type !== undefined ? { type } : {}),
+            ...(difficulty !== undefined ? { difficulty } : {}),
+            ...(explanation !== undefined ? { explanation: explanation || null } : {}),
+            ...(points !== undefined ? { points } : {}),
+            ...(isActive !== undefined ? { isActive } : {}),
+          },
         },
-      });
+        { session }
+      );
 
       if (options) {
-        await syncQuestionOptions(tx, params.id, options);
+        await syncQuestionOptions(session, params.id, options);
       }
-
-      return tx.question.findUniqueOrThrow({
-        where: { id: params.id },
-        include: questionInclude,
-      });
     });
-
-    await writeAudit({
-      userId: auth.user.id,
-      action: "question.update",
-      entity: "Question",
-      entityId: question.id,
-      metadata: { fields: Object.keys(parsed.data) },
-    });
-
-    return NextResponse.json({ question });
   } catch (err) {
     if (err instanceof OptionInUseError) return conflict(err.message);
     throw err;
+  } finally {
+    await session.endSession();
   }
+
+  await writeAudit({
+    userId: auth.user.id,
+    action: "question.update",
+    entity: "Question",
+    entityId: params.id,
+    metadata: { fields: Object.keys(parsed.data) },
+  });
+
+  const question = await loadAdminQuestion(params.id);
+  if (!question) return notFound("Question");
+
+  return NextResponse.json({ question });
 }
 
 export async function DELETE(_req: Request, { params }: Params) {
   const auth = await requireApiAdmin();
   if (auth.error) return auth.error;
 
-  const question = await prisma.question.findUnique({
-    where: { id: params.id },
-    select: { id: true, subjectId: true, _count: { select: { userAnswers: true } } },
-  });
+  await connectToDatabase();
+
+  const question = await QuestionModel.findOne({ _id: params.id }).select("subjectId").lean();
   if (!question) return notFound("Question");
 
+  const answerCount = await UserAnswerModel.countDocuments({ questionId: params.id });
+
   // Deleting would cascade away the answers that make past results reviewable.
-  if (question._count.userAnswers > 0) {
+  if (answerCount > 0) {
     return conflict(
-      `This question has been answered in ${question._count.userAnswers} attempt(s). Deactivate it instead — it will stop appearing in new exams while past results stay intact.`
+      `This question has been answered in ${answerCount} attempt(s). Deactivate it instead — it will stop appearing in new exams while past results stay intact.`
     );
   }
 
-  await prisma.question.delete({ where: { id: params.id } });
+  // Mongo enforces no cascade of its own, so the options (and any stray flags) go through
+  // the explicit cascade rather than a bare delete.
+  await deleteQuestions([params.id]);
 
   await writeAudit({
     userId: auth.user.id,

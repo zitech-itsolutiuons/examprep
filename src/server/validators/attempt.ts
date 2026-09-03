@@ -1,7 +1,9 @@
 import { z } from "zod";
 
+import { id } from "@/server/validators/id";
+
 export const startAttemptSchema = z.object({
-  subjectId: z.string().cuid("Choose a subject to start"),
+  subjectId: id("Choose a subject to start"),
 });
 
 /**
@@ -10,13 +12,13 @@ export const startAttemptSchema = z.object({
  * An empty array clears the answer (used by "Clear selection" and by skipping).
  */
 export const saveAnswerSchema = z.object({
-  questionId: z.string().cuid(),
-  selectedOptionIds: z.array(z.string().cuid()).max(8),
+  questionId: id(),
+  selectedOptionIds: z.array(id()).max(8),
   isSkipped: z.boolean().optional().default(false),
 });
 
 export const flagQuestionSchema = z.object({
-  questionId: z.string().cuid(),
+  questionId: id(),
   flagged: z.boolean(),
 });
 
